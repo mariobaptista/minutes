@@ -7177,7 +7177,12 @@
       retryBtn.textContent = 'Retrying';
       try {
         await invoke('cmd_retry_processing_job', { jobId });
-        await dismissOutputNotice();
+        // Retry changes the job back to queued before work starts. Do not call
+        // the backend dismiss command here: that races with the queued state and
+        // either no-ops or marks the wrong lifecycle event. Hide this stale notice
+        // locally; if the retry fails again, the worker will surface a fresh one.
+        clearOutputNoticeAutoDismiss();
+        updateOutputNotice(null);
         if (typeof loadProcessingJobsCenter === 'function') await loadProcessingJobsCenter();
         if (typeof startFastPoll === 'function') startFastPoll();
       } catch (err) {

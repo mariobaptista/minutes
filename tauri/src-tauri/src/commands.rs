@@ -3000,6 +3000,14 @@ fn startup_retryable_output_notice_from_job(
     Some(notice)
 }
 
+const STARTUP_RETRYABLE_NOTICE_WINDOW_DAYS: i64 = 3;
+
+fn startup_retryable_notice_is_recent(job: &minutes_core::jobs::ProcessingJob) -> bool {
+    let reference_time = job.finished_at.as_ref().unwrap_or(&job.created_at);
+    *reference_time
+        >= chrono::Local::now() - chrono::Duration::days(STARTUP_RETRYABLE_NOTICE_WINDOW_DAYS)
+}
+
 fn latest_retryable_output_notice() -> Option<OutputNotice> {
     let mut jobs = minutes_core::jobs::list_jobs()
         .into_iter()
@@ -3008,6 +3016,7 @@ fn latest_retryable_output_notice() -> Option<OutputNotice> {
                 job.state,
                 minutes_core::jobs::JobState::Failed | minutes_core::jobs::JobState::NeedsReview
             ) && job.notice_dismissed_at.is_none()
+                && startup_retryable_notice_is_recent(job)
         })
         .collect::<Vec<_>>();
 
@@ -3020,6 +3029,37 @@ fn latest_retryable_output_notice() -> Option<OutputNotice> {
     jobs.into_iter()
         .next()
         .and_then(|job| startup_retryable_output_notice_from_job(&job))
+}
+
+fn job_id_from_notice(notice: &OutputNotice) -> Option<String> {
+    if let Some(job_id) = notice.job_id.as_ref().filter(|id| !id.is_empty()) {
+        return Some(job_id.clone());
+    }
+
+    let path = Path::new(&notice.path);
+    let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+    if !stem.starts_with("job-") {
+        return None;
+    }
+
+    let job = minutes_core::jobs::load_job(stem)?;
+    let notice_path = path.to_string_lossy();
+    let matches_job_path =
+        job.audio_path == notice_path || job.output_path.as_deref() == Some(notice_path.as_ref());
+    matches_job_path.then_some(job.id)
+}
+
+fn persist_output_notice_dismissal(notice: &OutputNotice) {
+    let Some(job_id) = job_id_from_notice(notice) else {
+        return;
+    };
+
+    if let Err(error) = minutes_core::jobs::dismiss_job_notice(&job_id) {
+        eprintln!(
+            "[minutes] failed to persist dismissed processing notice for {}: {}",
+            job_id, error
+        );
+    }
 }
 
 pub fn seed_latest_retryable_output(latest_output: &Arc<Mutex<Option<OutputNotice>>>) {
@@ -5775,18 +5815,13 @@ pub fn cmd_clear_open_artifact(state: tauri::State<AppState>) -> Result<(), Stri
 
 #[tauri::command]
 pub fn cmd_clear_latest_output(state: tauri::State<AppState>) {
-    let dismissed_job_id = state
+    let dismissed_notice = state
         .latest_output
         .lock()
         .ok()
-        .and_then(|current| current.as_ref().and_then(|notice| notice.job_id.clone()));
-    if let Some(job_id) = dismissed_job_id {
-        if let Err(error) = minutes_core::jobs::dismiss_job_notice(&job_id) {
-            eprintln!(
-                "[minutes] failed to persist dismissed processing notice for {}: {}",
-                job_id, error
-            );
-        }
+        .and_then(|current| current.clone());
+    if let Some(notice) = dismissed_notice.as_ref() {
+        persist_output_notice_dismissal(notice);
     }
     set_latest_output(&state.latest_output, None);
 }
@@ -7522,6 +7557,7 @@ pub fn cmd_open_meeting_url(app: tauri::AppHandle, url: String) -> Result<(), St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
@@ -9224,6 +9260,148 @@ mod tests {
             let notice = latest_retryable_output_notice().expect("older retryable notice");
             assert_eq!(notice.job_id.as_deref(), Some("job-old-visible"));
             assert_eq!(notice.path, "/tmp/old-visible.wav");
+        });
+    }
+
+    #[test]
+    fn latest_retryable_notice_ignores_stale_historical_failures() {
+        with_temp_home(|_| {
+            let old = chrono::Local::now() - chrono::Duration::days(10);
+            let job = minutes_core::jobs::ProcessingJob {
+                id: "job-old-undismissed".into(),
+                title: Some("Old undismissed".into()),
+                mode: CaptureMode::Meeting,
+                content_type: ContentType::Meeting,
+                state: minutes_core::jobs::JobState::Failed,
+                stage: minutes_core::jobs::JobState::Failed.default_stage(),
+                output_path: None,
+                audio_path: "/tmp/old-undismissed.wav".into(),
+                error: Some("historical failure".into()),
+                created_at: old,
+                started_at: None,
+                finished_at: Some(old),
+                notice_dismissed_at: None,
+                recording_started_at: None,
+                recording_finished_at: None,
+                context_session_id: None,
+                user_notes: None,
+                pre_context: None,
+                calendar_event: None,
+                template_slug: None,
+                word_count: Some(0),
+                owner_pid: None,
+                recording_health: None,
+            };
+            minutes_core::jobs::write_job(&job).unwrap();
+
+            assert!(
+                latest_retryable_output_notice().is_none(),
+                "old pre-marker failed jobs should stay in recovery/history, not nag on every startup"
+            );
+        });
+    }
+
+    #[test]
+    fn dismiss_notice_resolves_job_from_audio_path_without_job_id() {
+        with_temp_home(|dir| {
+            let now = chrono::Local::now();
+            let audio_path = dir.join("job-path-fallback.wav");
+            fs::write(&audio_path, b"fake-wav").unwrap();
+            let job = minutes_core::jobs::ProcessingJob {
+                id: "job-path-fallback".into(),
+                title: Some("Path fallback".into()),
+                mode: CaptureMode::Meeting,
+                content_type: ContentType::Meeting,
+                state: minutes_core::jobs::JobState::Failed,
+                stage: minutes_core::jobs::JobState::Failed.default_stage(),
+                output_path: None,
+                audio_path: audio_path.display().to_string(),
+                error: Some("old failure".into()),
+                created_at: now,
+                started_at: None,
+                finished_at: Some(now),
+                notice_dismissed_at: None,
+                recording_started_at: None,
+                recording_finished_at: None,
+                context_session_id: None,
+                user_notes: None,
+                pre_context: None,
+                calendar_event: None,
+                template_slug: None,
+                word_count: Some(0),
+                owner_pid: None,
+                recording_health: None,
+            };
+            minutes_core::jobs::write_job(&job).unwrap();
+
+            let notice = OutputNotice {
+                kind: "preserved-capture".into(),
+                title: "Processing failed".into(),
+                path: audio_path.display().to_string(),
+                detail: "Previous processing failed".into(),
+                job_id: None,
+            };
+
+            assert_eq!(
+                job_id_from_notice(&notice).as_deref(),
+                Some("job-path-fallback")
+            );
+            persist_output_notice_dismissal(&notice);
+
+            let dismissed = minutes_core::jobs::load_job("job-path-fallback").unwrap();
+            assert!(dismissed.notice_dismissed_at.is_some());
+            assert!(
+                latest_retryable_output_notice().is_none(),
+                "path-only dismissed notices should not reappear after restart"
+            );
+        });
+    }
+
+    #[test]
+    fn stale_retry_notice_does_not_mark_queued_job_dismissed() {
+        with_temp_home(|dir| {
+            let now = chrono::Local::now();
+            let audio_path = dir.join("job-retry-ordering.wav");
+            fs::write(&audio_path, b"fake-wav").unwrap();
+            let job = minutes_core::jobs::ProcessingJob {
+                id: "job-retry-ordering".into(),
+                title: Some("Retry ordering".into()),
+                mode: CaptureMode::Meeting,
+                content_type: ContentType::Meeting,
+                state: minutes_core::jobs::JobState::Failed,
+                stage: minutes_core::jobs::JobState::Failed.default_stage(),
+                output_path: None,
+                audio_path: audio_path.display().to_string(),
+                error: Some("old failure".into()),
+                created_at: now,
+                started_at: None,
+                finished_at: Some(now),
+                notice_dismissed_at: None,
+                recording_started_at: None,
+                recording_finished_at: None,
+                context_session_id: None,
+                user_notes: None,
+                pre_context: None,
+                calendar_event: None,
+                template_slug: None,
+                word_count: Some(0),
+                owner_pid: None,
+                recording_health: None,
+            };
+            minutes_core::jobs::write_job(&job).unwrap();
+            let stale_notice = output_notice_from_job(&job).unwrap();
+
+            let requeued = minutes_core::jobs::requeue_job(&job.id).unwrap().unwrap();
+            assert_eq!(requeued.state, minutes_core::jobs::JobState::Queued);
+
+            persist_output_notice_dismissal(&stale_notice);
+
+            let loaded = minutes_core::jobs::load_job(&job.id).unwrap();
+            assert_eq!(loaded.state, minutes_core::jobs::JobState::Queued);
+            assert!(
+                loaded.notice_dismissed_at.is_none(),
+                "retry start should hide the old notice locally, not persist a dismissal"
+            );
         });
     }
 
