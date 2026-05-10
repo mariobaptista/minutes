@@ -2944,33 +2944,11 @@ mod tests {
         assert!(!<SileroSidecarVad as VadEngine>::is_healthy(&silero));
     }
 
-    /// Parity test: feed `crates/assets/demo.wav` through both
-    /// OrtSileroVad and the existing whisper-Silero at the
-    /// production 100 ms cadence, then check the codex-tightened bar
-    /// from PLAN-vad-refactor.md:
-    ///
-    /// - Zero missed speech islands. Every contiguous speech region
-    ///   whisper-Silero flags must also be flagged by ort-Silero.
-    ///   Utterance loss is a release-blocking regression.
-    /// - Boundary drift up to ±150 ms tolerable; here we use ±200 ms
-    ///   (2 chunks at 100 ms cadence) to keep the test stable across
-    ///   minor model updates.
-    /// - No phantom speech. ort-Silero must not flag speech that is
-    ///   not within ±200 ms of some whisper-Silero island.
-    ///
-    /// `#[ignore]` because it requires both the ONNX model and the
-    /// whisper ggml model. Run with:
-    ///
-    ///   cargo test -p minutes-core --features "whisper streaming
-    ///   vad-ort" --lib live_transcript::tests::parity_with_whisper
-    ///   -- --ignored --nocapture
+    /// Look up the canonical Silero model paths for parity tests.
+    /// Returns `None` if either model is missing — the caller prints
+    /// a `skipping` message and returns instead of failing.
     #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
-    #[test]
-    #[ignore]
-    fn parity_ort_silero_vs_whisper_silero_on_demo_wav() {
-        use crate::silero_vad::OrtSileroVad;
-        use crate::vad::VadEngine;
-
+    fn parity_model_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let onnx_path = dirs::home_dir()
             .unwrap()
             .join(".minutes/models/silero-vad-v6.2.0.onnx");
@@ -2978,35 +2956,43 @@ mod tests {
             .unwrap()
             .join(".minutes/models/ggml-silero-v6.2.0.bin");
         if !onnx_path.exists() || !ggml_path.exists() {
-            eprintln!(
-                "[parity] skipping: need both {} and {}",
-                onnx_path.display(),
-                ggml_path.display()
-            );
-            return;
+            return None;
         }
+        Some((onnx_path, ggml_path))
+    }
 
-        let cargo_manifest = env!("CARGO_MANIFEST_DIR");
-        let demo_wav = std::path::PathBuf::from(cargo_manifest)
+    /// Resolve a fixture path under `crates/assets/`. Returns `None`
+    /// if the fixture is missing — caller skips. All parity fixtures
+    /// are committed to the repo, so this is mostly a hedge against
+    /// running tests from a partial checkout.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    fn parity_fixture_path(name: &str) -> Option<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("crate parent")
-            .join("assets/demo.wav");
-        if !demo_wav.exists() {
-            eprintln!("[parity] no demo.wav at {}", demo_wav.display());
-            return;
-        }
+            .join("assets")
+            .join(name);
+        path.exists().then_some(path)
+    }
 
-        let samples = read_wav_samples(&demo_wav);
-        eprintln!(
-            "[parity] loaded {} samples ({:.1}s at 16kHz)",
-            samples.len(),
-            samples.len() as f32 / 16_000.0
-        );
+    /// Run a fixture through both OrtSileroVad and SileroSidecarVad
+    /// at the production 100 ms cadence and return the per-chunk
+    /// `speaking` flags. Returned vectors are the same length and
+    /// represent identical timestamps so the parity-check helper can
+    /// just zip-walk them.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    fn run_both_engines_on_fixture(
+        fixture_path: &std::path::Path,
+        onnx_path: &std::path::Path,
+        ggml_path: &std::path::Path,
+    ) -> (Vec<bool>, Vec<bool>) {
+        use crate::silero_vad::OrtSileroVad;
+        use crate::vad::VadEngine;
 
-        let mut ort_engine = OrtSileroVad::new(&onnx_path).unwrap();
-        let mut whisper_engine = SileroSidecarVad::new(&ggml_path).unwrap();
+        let samples = read_wav_samples(fixture_path);
+        let mut ort_engine = OrtSileroVad::new(onnx_path).unwrap();
+        let mut whisper_engine = SileroSidecarVad::new(ggml_path).unwrap();
 
-        // 100 ms cadence matches the recording sidecar.
         let chunk = 1600;
         let mut ort_speak: Vec<bool> = Vec::new();
         let mut whisper_speak: Vec<bool> = Vec::new();
@@ -3017,24 +3003,50 @@ mod tests {
             ort_speak.push(ort.speaking);
             whisper_speak.push(wh.speaking);
         }
+        (ort_speak, whisper_speak)
+    }
 
-        let islands = contiguous_runs(&whisper_speak, true);
-        let ort_islands = contiguous_runs(&ort_speak, true);
+    /// Apply the codex parity bar from PLAN-vad-refactor.md to
+    /// per-chunk speaking flags from both engines. `label` shows up
+    /// in the eprintln preamble so test output is greppable per
+    /// fixture.
+    ///
+    /// Bars enforced:
+    /// 1. Zero missed islands. Every contiguous speech region
+    ///    whisper-Silero flags must overlap with ≥1 ort-Silero
+    ///    speaking chunk. Utterance loss is release-blocking.
+    /// 2. Boundary drift ≤ 2 chunks (±200 ms). Slightly looser than
+    ///    the ±150 ms in the design doc, to absorb model-version
+    ///    noise without flapping in CI.
+    /// 3. No phantom speech. Every ort-Silero speaking chunk must
+    ///    fall within ±2 chunks of some whisper-Silero island.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    fn assert_parity_bar(label: &str, ort_speak: &[bool], whisper_speak: &[bool]) {
+        assert_eq!(
+            ort_speak.len(),
+            whisper_speak.len(),
+            "[{}] engine output lengths must match",
+            label
+        );
+
+        let islands = contiguous_runs(whisper_speak, true);
+        let ort_islands = contiguous_runs(ort_speak, true);
         eprintln!(
-            "[parity] whisper-silero islands: {} | ort-silero islands: {} | ort speaking windows: {}/{}",
+            "[parity:{label}] whisper islands={} | ort islands={} | ort speaking={}/{}",
             islands.len(),
             ort_islands.len(),
             ort_speak.iter().filter(|&&s| s).count(),
             ort_speak.len()
         );
 
-        // Bar 1: zero missed islands.
+        const DRIFT_TOLERANCE_CHUNKS: i64 = 2;
+
+        // Bar 1.
         for (start, end) in &islands {
             let any_overlap = ort_speak[*start..*end].iter().any(|&s| s);
             assert!(
                 any_overlap,
-                "ort-silero missed an entire speech island at chunks [{},{}) ({:.1}s-{:.1}s) — \
-                 release-blocking regression",
+                "[{label}] ort-silero missed an entire whisper-silero island at chunks [{},{}) ({:.1}s-{:.1}s)",
                 start,
                 end,
                 *start as f32 * 0.1,
@@ -3042,8 +3054,7 @@ mod tests {
             );
         }
 
-        // Bar 2: boundary drift within ±200 ms (2 chunks).
-        const DRIFT_TOLERANCE_CHUNKS: i64 = 2;
+        // Bar 2.
         for (start, end) in &islands {
             let nearest_start = ort_speak
                 .iter()
@@ -3061,21 +3072,21 @@ mod tests {
                 .unwrap_or(i64::MAX);
             assert!(
                 nearest_start <= DRIFT_TOLERANCE_CHUNKS,
-                "island start at chunk {} ({:.1}s): nearest ort-silero speech is {} chunks away (>200ms drift)",
+                "[{label}] island start at chunk {} ({:.1}s): nearest ort-silero speech is {} chunks away (>200ms drift)",
                 start,
                 *start as f32 * 0.1,
                 nearest_start
             );
             assert!(
                 nearest_end <= DRIFT_TOLERANCE_CHUNKS,
-                "island end at chunk {} ({:.1}s): nearest ort-silero speech is {} chunks away (>200ms drift)",
+                "[{label}] island end at chunk {} ({:.1}s): nearest ort-silero speech is {} chunks away (>200ms drift)",
                 end,
                 *end as f32 * 0.1,
                 nearest_end
             );
         }
 
-        // Bar 3: no phantom speech outside ±200 ms of any island.
+        // Bar 3.
         for (i, &is_speaking) in ort_speak.iter().enumerate() {
             if !is_speaking {
                 continue;
@@ -3088,12 +3099,150 @@ mod tests {
             });
             assert!(
                 inside_or_near,
-                "phantom ort-silero speech at chunk {} ({:.1}s) — \
-                 not within ±200ms of any whisper-silero island",
+                "[{label}] phantom ort-silero speech at chunk {} ({:.1}s) — not within ±200ms of any whisper-silero island",
                 i,
                 i as f32 * 0.1
             );
         }
+    }
+
+    /// Parity on the original demo.wav. Continuous speech, one
+    /// island, both engines should agree trivially. Sanity baseline
+    /// for the fixture-based stress tests below.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_ort_silero_vs_whisper_silero_on_demo_wav() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:demo] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("demo.wav") else {
+            eprintln!("[parity:demo] skipping: no demo.wav fixture");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        assert_parity_bar("demo", &ort_speak, &whisper_speak);
+    }
+
+    /// Fixture A. silence → 80 ms speech spike → silence. Below the
+    /// 150 ms min_speech filter that snakers4's reference and our
+    /// smoothing FSM enforce. ort-Silero must report zero speech on
+    /// this fixture; if it ever stops filtering, every cough and
+    /// click would fire the ASR pipeline (codex's commit 2 review
+    /// #1 finding).
+    ///
+    /// This is intentionally NOT a cross-engine parity test:
+    /// whisper-rs's bundled Silero runs in full-buffer rescan mode
+    /// and is more permissive on brief spikes than our streaming
+    /// implementation with the explicit min_speech gate. That
+    /// permissiveness is one of the structural problems Option B
+    /// solves; running the parity bar here would penalize ort for
+    /// behaving correctly. We log whisper's behavior for diagnostic
+    /// awareness and assert only on ort.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_brief_spike_under_min_speech_is_silence() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:brief_spike] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("parity_brief_spike.wav") else {
+            eprintln!("[parity:brief_spike] skipping: fixture missing — run examples/build_parity_fixtures");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        let ort_speech = ort_speak.iter().filter(|&&s| s).count();
+        let whisper_speech = whisper_speak.iter().filter(|&&s| s).count();
+        eprintln!(
+            "[parity:brief_spike] ort_speech_chunks={} whisper_speech_chunks={} (whisper expected to be over-permissive — that's the bug Option B fixes)",
+            ort_speech, whisper_speech
+        );
+        assert_eq!(
+            ort_speech, 0,
+            "ort-silero must filter an 80 ms spike (below 150 ms min_speech)"
+        );
+    }
+
+    /// Fixture B. Three 1.5 s utterances separated by 300 / 500 /
+    /// 800 ms gaps, with 200 ms head and 800 ms tail silence. The
+    /// 300 ms gap is below min_silence (500 ms) so utterances 1 and
+    /// 2 should merge into one island; 500 ms is at the boundary;
+    /// 800 ms is well above so utterance 3 is clearly its own
+    /// island. Both engines should agree on the segmentation,
+    /// whatever it works out to.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_three_utterances_with_varied_gaps() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:three_utterances] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("parity_three_utterances.wav") else {
+            eprintln!("[parity:three_utterances] skipping: fixture missing");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        assert_parity_bar("three_utterances", &ort_speak, &whisper_speak);
+    }
+
+    /// Fixture C. demo.wav scaled to 5% amplitude — well below the
+    /// energy-VAD threshold, but model-based VADs are robust to
+    /// quiet speech. Both should still detect the segment.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_low_volume_speech_still_detected() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:low_volume] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("parity_low_volume.wav") else {
+            eprintln!("[parity:low_volume] skipping: fixture missing");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        assert_parity_bar("low_volume", &ort_speak, &whisper_speak);
+        // Beyond cross-engine parity: if NEITHER engine detects any
+        // speech in 10s of quiet-but-real speech, that's a
+        // model-quality alarm we want to surface explicitly.
+        let any_ort = ort_speak.iter().any(|&s| s);
+        let any_whisper = whisper_speak.iter().any(|&s| s);
+        assert!(
+            any_ort || any_whisper,
+            "neither engine detected speech in low-volume fixture — model-quality regression?"
+        );
+    }
+
+    /// Fixture D. demo.wav truncated to 16384 + 137 = 16521 samples
+    /// (≈1.033 s). The streaming engine processes 32 full 512-sample
+    /// chunks and leaves a 137-sample tail in the buffer that never
+    /// reaches the ONNX session. This stresses the partial-tail path
+    /// — if zero-padding ever gets added to the buffer-flush logic,
+    /// the LSTM state could pick up a phantom silence and drift the
+    /// final decision. Both engines processing the same short
+    /// recording should agree.
+    #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
+    #[test]
+    #[ignore]
+    fn parity_trailing_partial_chunk_handled_consistently() {
+        let Some((onnx_path, ggml_path)) = parity_model_paths() else {
+            eprintln!("[parity:trailing_partial] skipping: missing Silero models");
+            return;
+        };
+        let Some(fixture) = parity_fixture_path("parity_trailing_partial.wav") else {
+            eprintln!("[parity:trailing_partial] skipping: fixture missing");
+            return;
+        };
+        let (ort_speak, whisper_speak) =
+            run_both_engines_on_fixture(&fixture, &onnx_path, &ggml_path);
+        assert_parity_bar("trailing_partial", &ort_speak, &whisper_speak);
     }
 
     #[cfg(all(feature = "whisper", feature = "streaming", feature = "vad-ort"))]
