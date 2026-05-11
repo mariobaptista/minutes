@@ -91,6 +91,29 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
     }
 
     func stop() async {
+        // Spin up the finalize heartbeat BEFORE the sampleQueue.sync block so
+        // the Rust parent sees stdout activity throughout the entire stop
+        // sequence. Long captures (1h+) take tens of seconds to write the
+        // moov atom inside `stream.stopCapture()`; without this signal, the
+        // parent would SIGKILL the helper before the .mov is finalized.
+        // See issue #216.
+        let finalizeStart = Date()
+        let heartbeatTask = Task { [finalizeStart] in
+            while !Task.isCancelled {
+                let elapsedMs = Int(Date().timeIntervalSince(finalizeStart) * 1000)
+                let payload: [String: Any] = [
+                    "event": "finalizing",
+                    "elapsed_ms": elapsedMs,
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: payload),
+                   let json = String(data: data, encoding: .utf8) {
+                    print(json)
+                    fflush(stdout)
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+
         // Flush and close stem files on the sample queue to serialize
         // with any in-flight writeStemSamples calls. Without this,
         // nil'ing on the main thread races with writes on sampleQueue.
@@ -100,15 +123,24 @@ final class NativeCallRecorder: NSObject, SCRecordingOutputDelegate, SCStreamOut
         }
 
         guard let stream else {
+            heartbeatTask.cancel()
             exit(0)
         }
 
         do {
             try await stream.stopCapture()
         } catch {
+            heartbeatTask.cancel()
             fputs("stopCapture failed: \(error)\n", stderr)
             exit(1)
         }
+
+        // stopCapture() returns when the framework has been told to stop, but
+        // the moov atom may still be in flight: the actual finalize completes
+        // when `recordingOutputDidFinishRecording` fires and calls exit(0).
+        // Keep the heartbeat alive across that window so the Rust parent
+        // doesn't see 30s of silence and SIGKILL us before the .mov is on
+        // disk. The heartbeat Task dies naturally when the process exits.
     }
 
     private func startMonitoring() {

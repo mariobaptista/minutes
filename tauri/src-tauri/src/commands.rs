@@ -9,8 +9,9 @@ use reqwest::header::{ACCEPT, CONTENT_LENGTH};
 use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -2393,15 +2394,177 @@ fn preserve_failed_capture_path(path: &std::path::Path, config: &Config) -> Opti
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
         .unwrap_or("bin");
-    let dest = dir.join(format!(
-        "{}-capture.{}",
-        chrono::Local::now().format("%Y-%m-%d-%H%M%S"),
-        ext
-    ));
+    let new_basename = unique_failed_capture_basename(&dir, ext);
+    let dest = dir.join(format!("{}.{}", new_basename, ext));
 
-    std::fs::copy(path, &dest).ok()?;
+    // O_CREAT|O_EXCL on dest. If another process or a prior aborted run
+    // raced to the same slot between `unique_failed_capture_basename` and
+    // here, we'd rather preserve the existing artifact than silently
+    // overwrite it (the previous overwrite-and-pray version was a pre-
+    // existing data-loss bug now plugged). On failure, leave the source
+    // intact — caller treats None as "couldn't preserve" and the original
+    // .mov remains on disk for manual recovery.
+    if copy_no_clobber_nofollow(path, &dest).is_err() {
+        return None;
+    }
     std::fs::remove_file(path).ok();
+
+    // Native call capture writes lossless per-source PCM stems next to the
+    // .mov (`<base>.voice.wav` / `<base>.system.wav`). When the .mov is
+    // truncated (issue #216) the stems are the only intact artifact; rescue
+    // them alongside the preserved path with matching new basenames so
+    // `diarize::discover_stems` finds them on retry. Failures here are
+    // best-effort — the .mov is already preserved.
+    rescue_paired_stems(path, &dir, &new_basename);
+
     Some(dest)
+}
+
+/// Copy `src` to `dest` with two invariants beyond `std::fs::copy`:
+///
+/// 1. **No-clobber on dest** — open with `O_CREAT|O_EXCL` (`create_new` in Rust
+///    std parlance) so a preexisting file at the destination is refused, not
+///    overwritten. Closes the TOCTOU window between basename selection
+///    (`unique_failed_capture_basename`) and the copy. Without this, a race
+///    that landed two preserves on the same name silently destroyed the
+///    earlier artifact.
+///
+/// 2. **No-follow on src** — open with `O_NOFOLLOW` on Unix so a symlink at
+///    the source path is rejected instead of having its target's contents
+///    materialized at `dest`. Closes the TOCTOU window between an earlier
+///    `symlink_metadata()` check and the open. Defense-in-depth: the only
+///    writer to `~/.minutes/native-captures/` is the Swift helper, but the
+///    principled fix is to never deref symlinks during a recovery move.
+///
+/// On a mid-stream copy failure (disk full, EIO, etc.), the partially-written
+/// destination file is removed so the caller's rollback only has to clean up
+/// successful prior copies, not also reason about half-written ones.
+fn copy_no_clobber_nofollow(src: &Path, dest: &Path) -> io::Result<u64> {
+    #[cfg(unix)]
+    let mut src_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(src)?
+    };
+    #[cfg(not(unix))]
+    let mut src_file = std::fs::File::open(src)?;
+
+    let mut dest_file = OpenOptions::new().write(true).create_new(true).open(dest)?;
+
+    match io::copy(&mut src_file, &mut dest_file) {
+        Ok(n) => Ok(n),
+        Err(error) => {
+            // Drop the half-written destination before returning so the
+            // caller's rollback doesn't have to also reason about an
+            // orphaned truncated file under the chosen basename.
+            drop(dest_file);
+            let _ = std::fs::remove_file(dest);
+            Err(error)
+        }
+    }
+}
+
+/// Pick a basename for a failed-capture artifact that doesn't collide with
+/// anything already present. Default precision is one second, which is fine
+/// in practice (a single recording produces one preserved artifact), but
+/// two failures landing in the same wall-clock second would silently
+/// overwrite each other (`fs::copy` overwrites). Append `-2`, `-3`, ... if
+/// any of the candidate slots — primary ext, `.voice.wav`, `.system.wav` —
+/// already exist for the chosen basename.
+fn unique_failed_capture_basename(dir: &Path, ext: &str) -> String {
+    let ts = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+    let primary = format!("{}-capture", ts);
+    if basename_is_free(dir, &primary, ext) {
+        return primary;
+    }
+    for n in 2..1000 {
+        let candidate = format!("{}-capture-{}", ts, n);
+        if basename_is_free(dir, &candidate, ext) {
+            return candidate;
+        }
+    }
+    // Pathological: 999 collisions in one second. Fall back to the primary
+    // name — fs::copy will overwrite, but at this point something is very
+    // wrong upstream and silent failure is no worse than crashing the
+    // recording-stop path.
+    primary
+}
+
+fn basename_is_free(dir: &Path, basename: &str, ext: &str) -> bool {
+    !dir.join(format!("{}.{}", basename, ext)).exists()
+        && !dir.join(format!("{}.voice.wav", basename)).exists()
+        && !dir.join(format!("{}.system.wav", basename)).exists()
+}
+
+/// Move any sibling `<stem>.voice.wav` / `<stem>.system.wav` files (the
+/// per-source PCM stems written by the native call capture helper) into
+/// `dest_dir` with `<new_basename>.voice.wav` / `<new_basename>.system.wav`
+/// names. No-op when the original path has no parent, no file stem, or no
+/// matching stems exist.
+///
+/// Two-phase: copy every stem first; only after all copies succeed remove
+/// the originals. If any copy fails, roll back partial copies and leave the
+/// originals in place. This avoids the failure mode where voice copies
+/// succeed and system fails (disk full, permission denied), since
+/// `diarize::discover_stem_plan` rejects a `(voice=present, system=missing)`
+/// pair (`SystemStemOnly` requires system to be the surviving one), so a
+/// partial rescue would silently delete the only intact stem.
+fn rescue_paired_stems(original: &std::path::Path, dest_dir: &Path, new_basename: &str) {
+    let Some(parent) = original.parent() else {
+        return;
+    };
+    let Some(stem) = original.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+
+    // Phase 1: enumerate stems that exist and carry data.
+    let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for suffix in ["voice", "system"] {
+        let src = parent.join(format!("{}.{}.wav", stem, suffix));
+        // Use symlink_metadata so a sibling that is a symlink (pointing at
+        // arbitrary content on disk) is not silently followed and copied
+        // as if it were a real stem.
+        let Ok(meta) = src.symlink_metadata() else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        if meta.len() == 0 {
+            continue;
+        }
+        let dest = dest_dir.join(format!("{}.{}.wav", new_basename, suffix));
+        plan.push((src, dest));
+    }
+
+    if plan.is_empty() {
+        return;
+    }
+
+    // Phase 2: copy all. On failure, roll back and leave originals.
+    // Uses `copy_no_clobber_nofollow` so each per-stem copy refuses to
+    // overwrite a preexisting destination, refuses to follow a symlink at
+    // the source, and removes its own half-written file on mid-stream
+    // failure. Rollback only has to clean up SUCCESSFUL prior copies.
+    let mut copied: Vec<PathBuf> = Vec::new();
+    for (src, dest) in &plan {
+        match copy_no_clobber_nofollow(src, dest) {
+            Ok(_) => copied.push(dest.clone()),
+            Err(_) => {
+                for partial in &copied {
+                    let _ = std::fs::remove_file(partial);
+                }
+                return;
+            }
+        }
+    }
+
+    // Phase 3: all copies succeeded; remove originals.
+    for (src, _) in &plan {
+        let _ = std::fs::remove_file(src);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -8258,6 +8421,293 @@ mod tests {
         assert!(!wav.exists());
         assert!(preserved.exists());
         assert!(preserved.starts_with(config.output_dir.join("failed-captures")));
+    }
+
+    /// Regression for issue #216: when the native call helper's .mov is moved
+    /// to failed-captures because it was truncated, the paired per-source PCM
+    /// stems must travel with it (with matching new basenames) so that
+    /// `diarize::discover_stems` finds them on retry.
+    #[test]
+    fn preserve_failed_capture_path_rescues_paired_stems() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        let native_captures = dir.path().join("native-captures");
+        std::fs::create_dir_all(&native_captures).unwrap();
+        let mov = native_captures.join("2026-05-11-103342-call.mov");
+        std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
+        let voice_stem = native_captures.join("2026-05-11-103342-call.voice.wav");
+        let system_stem = native_captures.join("2026-05-11-103342-call.system.wav");
+        std::fs::write(&voice_stem, vec![2_u8; 2048]).unwrap();
+        std::fs::write(&system_stem, vec![3_u8; 2048]).unwrap();
+
+        let preserved = preserve_failed_capture_path(&mov, &config).expect("preserve");
+
+        assert!(!mov.exists(), "original .mov should be moved");
+        assert!(!voice_stem.exists(), "voice stem should be moved");
+        assert!(!system_stem.exists(), "system stem should be moved");
+        assert!(preserved.exists());
+        assert_eq!(preserved.extension().and_then(|e| e.to_str()), Some("mov"));
+
+        // discover_stems looks for `<basename>.voice.wav` next to the audio.
+        // Verify the rescued stems use the SAME new basename as the .mov.
+        let dest_stem = preserved
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+        let dest_dir = preserved.parent().unwrap();
+        assert!(
+            dest_dir.join(format!("{}.voice.wav", dest_stem)).exists(),
+            "voice stem should be rescued next to the .mov with matching basename"
+        );
+        assert!(
+            dest_dir.join(format!("{}.system.wav", dest_stem)).exists(),
+            "system stem should be rescued next to the .mov with matching basename"
+        );
+    }
+
+    /// When the .mov has no paired stems (e.g. legacy capture path), preserve
+    /// must still move the .mov successfully — stem rescue is best-effort.
+    #[test]
+    fn preserve_failed_capture_path_works_without_paired_stems() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        let mov = dir.path().join("2026-05-11-103342-call.mov");
+        std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
+
+        let preserved = preserve_failed_capture_path(&mov, &config).expect("preserve");
+
+        assert!(!mov.exists());
+        assert!(preserved.exists());
+    }
+
+    /// If a destination slot somehow exists when copy_no_clobber_nofollow
+    /// runs (TOCTOU race past unique_failed_capture_basename, or an
+    /// aborted prior run left a file), we must refuse to overwrite.
+    /// The preexisting artifact stays intact and the new preserve returns
+    /// None so the caller leaves the source on disk for manual recovery.
+    #[test]
+    fn preserve_failed_capture_path_refuses_to_clobber_existing_dest() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        let failed_dir = config.output_dir.join("failed-captures");
+        std::fs::create_dir_all(&failed_dir).unwrap();
+
+        // Plant a file at EVERY basename slot unique_failed_capture_basename
+        // would pick (primary + 999 fallbacks) — extreme but proves the
+        // copy_no_clobber_nofollow contract: if there's no free slot AND no
+        // basename-generation path leads to a free slot, preserve gives up
+        // rather than overwriting. In practice we expect the basename
+        // picker to find a free slot. This test forces the no-clobber path
+        // to trigger by saturating slots.
+        let ts = chrono::Local::now().format("%Y-%m-%d-%H%M%S").to_string();
+        let primary = format!("{}-capture", ts);
+        std::fs::write(failed_dir.join(format!("{}.mov", primary)), b"prior").unwrap();
+        for n in 2..1000 {
+            let alt = format!("{}-capture-{}", ts, n);
+            std::fs::write(failed_dir.join(format!("{}.mov", alt)), b"prior").unwrap();
+        }
+
+        let mov = dir.path().join("call.mov");
+        std::fs::write(&mov, vec![9_u8; 1024]).unwrap();
+
+        let result = preserve_failed_capture_path(&mov, &config);
+
+        assert!(
+            result.is_none(),
+            "preserve must give up rather than clobber an existing artifact"
+        );
+        assert!(
+            mov.exists(),
+            "source .mov must stay intact when preserve gives up"
+        );
+        // Confirm a planted file is unchanged.
+        let planted = failed_dir.join(format!("{}.mov", primary));
+        assert_eq!(std::fs::read(&planted).unwrap(), b"prior");
+    }
+
+    /// Same-second failures must not silently overwrite a previously
+    /// preserved capture. `unique_failed_capture_basename` should pick a
+    /// distinct name when the timestamped primary is already taken.
+    #[test]
+    fn preserve_failed_capture_path_avoids_same_second_collision() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        let native_captures = dir.path().join("native-captures");
+        std::fs::create_dir_all(&native_captures).unwrap();
+
+        let mov_a = native_captures.join("first-call.mov");
+        std::fs::write(&mov_a, vec![1_u8; 1024]).unwrap();
+        let preserved_a = preserve_failed_capture_path(&mov_a, &config).expect("preserve a");
+
+        let mov_b = native_captures.join("second-call.mov");
+        std::fs::write(&mov_b, vec![2_u8; 1024]).unwrap();
+        let preserved_b = preserve_failed_capture_path(&mov_b, &config).expect("preserve b");
+
+        assert_ne!(
+            preserved_a, preserved_b,
+            "two preserves in the same second must not produce the same path"
+        );
+        assert!(preserved_a.exists(), "first preserved file must survive");
+        assert!(preserved_b.exists(), "second preserved file must exist");
+
+        // Content sanity: A was 1s, B was 2s; both should be intact.
+        let a = std::fs::read(&preserved_a).unwrap();
+        let b = std::fs::read(&preserved_b).unwrap();
+        assert_eq!(a[0], 1, "preserved A must keep its content");
+        assert_eq!(
+            b[0], 2,
+            "preserved B must keep its content (not overwritten by A)"
+        );
+    }
+
+    /// If one stem rescue fails partway through (system stem copy errors),
+    /// the function must roll back the partial copy of the voice stem AND
+    /// leave the originals in place. The opposite — deleting voice while
+    /// leaving system orphaned — produces a `(voice=missing, system=present)`
+    /// pair that `discover_stem_plan` rejects unless system exists, which
+    /// silently breaks recovery.
+    #[test]
+    #[cfg(unix)]
+    fn rescue_paired_stems_rolls_back_partial_copy() {
+        let dir = TempDir::new().unwrap();
+        let failed_dir = dir.path().join("failed-captures");
+        std::fs::create_dir_all(&failed_dir).unwrap();
+        let native_captures = dir.path().join("native-captures");
+        std::fs::create_dir_all(&native_captures).unwrap();
+
+        let mov = native_captures.join("call.mov");
+        std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
+        let voice_stem = native_captures.join("call.voice.wav");
+        let system_stem = native_captures.join("call.system.wav");
+        std::fs::write(&voice_stem, vec![2_u8; 2048]).unwrap();
+        std::fs::write(&system_stem, vec![3_u8; 2048]).unwrap();
+
+        // Force the second copy (system) to fail by pre-creating its
+        // destination as a directory, which `fs::copy` cannot overwrite.
+        // Phase order in `rescue_paired_stems` walks ["voice", "system"], so
+        // voice copies successfully and then system fails and we roll back.
+        let probe_basename = "rescue-rollback-probe";
+        let system_dest_blocker = failed_dir.join(format!("{}.system.wav", probe_basename));
+        std::fs::create_dir(&system_dest_blocker).expect("create blocker dir");
+
+        rescue_paired_stems(&mov, &failed_dir, probe_basename);
+
+        // Originals must still be on disk: nothing was committed.
+        assert!(
+            voice_stem.exists(),
+            "voice original must remain when rescue rolls back"
+        );
+        assert!(
+            system_stem.exists(),
+            "system original must remain when rescue rolls back"
+        );
+        // The voice copy that succeeded in phase 2 must have been removed.
+        let voice_partial = failed_dir.join(format!("{}.voice.wav", probe_basename));
+        assert!(
+            !voice_partial.exists(),
+            "partial voice copy must be rolled back (was at {})",
+            voice_partial.display()
+        );
+    }
+
+    /// Symlink stems are not real audio data. Following them via
+    /// `metadata()` would let an attacker (or a misconfigured environment)
+    /// trick rescue into copying arbitrary file contents into
+    /// `failed-captures/` and unlinking the symlink target's path entry.
+    /// Use `symlink_metadata` and skip non-regular entries.
+    #[test]
+    #[cfg(unix)]
+    fn rescue_paired_stems_skips_symlink_siblings() {
+        let dir = TempDir::new().unwrap();
+        let native_captures = dir.path().join("native-captures");
+        std::fs::create_dir_all(&native_captures).unwrap();
+        let failed_dir = dir.path().join("failed-captures");
+        std::fs::create_dir_all(&failed_dir).unwrap();
+
+        let mov = native_captures.join("call.mov");
+        std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
+
+        // Symlink the voice stem to an arbitrary file outside native-captures.
+        let outside_secret = dir.path().join("outside-secret.txt");
+        std::fs::write(&outside_secret, b"sensitive contents").unwrap();
+        let voice_link = native_captures.join("call.voice.wav");
+        std::os::unix::fs::symlink(&outside_secret, &voice_link).unwrap();
+
+        // Real system stem with data, so the function has something to attempt.
+        let system_stem = native_captures.join("call.system.wav");
+        std::fs::write(&system_stem, vec![3_u8; 2048]).unwrap();
+
+        rescue_paired_stems(&mov, &failed_dir, "rescued");
+
+        // The symlinked voice stem MUST NOT be copied or unlinked.
+        assert!(
+            voice_link.exists(),
+            "symlinked voice stem must be left alone"
+        );
+        assert!(
+            outside_secret.exists(),
+            "symlink target must not be touched"
+        );
+        let voice_dest = failed_dir.join("rescued.voice.wav");
+        assert!(
+            !voice_dest.exists(),
+            "symlinked voice must NOT be materialized in failed-captures"
+        );
+
+        // The real system stem should still rescue successfully (single-stem
+        // is a valid plan for diarize::discover_stem_plan).
+        let system_dest = failed_dir.join("rescued.system.wav");
+        assert!(
+            system_dest.exists(),
+            "real system stem should rescue independently"
+        );
+        assert!(
+            !system_stem.exists(),
+            "system original should be moved on successful rescue"
+        );
+    }
+
+    /// Empty paired stems (zero-length placeholder files) should not be moved
+    /// alongside; only stems with actual data count as rescuable.
+    #[test]
+    fn preserve_failed_capture_path_skips_empty_paired_stems() {
+        let dir = TempDir::new().unwrap();
+        let config = Config {
+            output_dir: dir.path().join("meetings"),
+            ..Config::default()
+        };
+        let native_captures = dir.path().join("native-captures");
+        std::fs::create_dir_all(&native_captures).unwrap();
+        let mov = native_captures.join("2026-05-11-103342-call.mov");
+        std::fs::write(&mov, vec![1_u8; 1024]).unwrap();
+        let voice_stem = native_captures.join("2026-05-11-103342-call.voice.wav");
+        let system_stem = native_captures.join("2026-05-11-103342-call.system.wav");
+        std::fs::write(&voice_stem, Vec::<u8>::new()).unwrap();
+        std::fs::write(&system_stem, Vec::<u8>::new()).unwrap();
+
+        let preserved = preserve_failed_capture_path(&mov, &config).expect("preserve");
+        let dest_stem = preserved.file_stem().and_then(|s| s.to_str()).unwrap();
+        let dest_dir = preserved.parent().unwrap();
+
+        // Zero-length stems should be left alone — moving them would just
+        // create misleading "stems exist" signals for discover_stems.
+        assert!(voice_stem.exists());
+        assert!(system_stem.exists());
+        assert!(!dest_dir.join(format!("{}.voice.wav", dest_stem)).exists());
+        assert!(!dest_dir.join(format!("{}.system.wav", dest_stem)).exists());
     }
 
     #[test]
