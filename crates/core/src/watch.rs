@@ -218,9 +218,11 @@ fn is_audio_container(path: &Path) -> bool {
         &Default::default(),
         &Default::default(),
     ) {
-        Ok(probed) => probed.format.tracks().iter().any(|track| {
-            track.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL
-        }),
+        Ok(probed) => probed
+            .format
+            .tracks()
+            .iter()
+            .any(|track| track.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL),
         Err(_) => false,
     }
 }
