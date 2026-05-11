@@ -41,6 +41,11 @@
 // signal is interpretable above the noise.
 // ──────────────────────────────────────────────────────────────
 
+#![cfg_attr(
+    not(all(feature = "whisper", feature = "streaming", feature = "vad-ort")),
+    allow(dead_code, unused_imports)
+)]
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
