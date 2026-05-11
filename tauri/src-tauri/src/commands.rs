@@ -2450,7 +2450,7 @@ fn start_native_call_recording(
     }
     minutes_core::pid::write_recording_metadata_with_context(mode, context_session_id.as_deref())
         .ok();
-    crate::update_tray_state(app_handle, true);
+    crate::sync_tray_state(app_handle);
     minutes_core::notes::save_recording_start().ok();
     minutes_core::events::append_event(minutes_core::events::recording_started_event(
         context_session_id.clone(),
@@ -4345,7 +4345,7 @@ pub fn start_recording(
     );
     minutes_core::pid::write_recording_metadata_with_context(mode, context_session_id.as_deref())
         .ok();
-    crate::update_tray_state(&app_handle, true);
+    crate::sync_tray_state(&app_handle);
 
     minutes_core::notes::save_recording_start().ok();
     eprintln!("{} started...", mode.noun());
@@ -4579,6 +4579,13 @@ pub fn launch_recording(
     if state.live_transcript_active.load(Ordering::Relaxed) {
         return Err("Live transcript in progress — stop it first".into());
     }
+    // Check both the in-process atomic and the cross-process PID file,
+    // mirroring the live transcript path. `cmd_install_update` and the
+    // palette dispatcher already treat the dictation PID as authoritative
+    // for "another Minutes is dictating", so this gate stays consistent.
+    if state.dictation_active.load(Ordering::Relaxed) || dictation_pid_active() {
+        return Err("Dictation in progress — stop it first".into());
+    }
 
     state.starting.store(true, Ordering::Relaxed);
     let rec = state.recording.clone();
@@ -4618,7 +4625,7 @@ pub fn launch_recording(
             requested_title,
             language_override,
         );
-        crate::update_tray_state(&app_done, false);
+        crate::sync_tray_state(&app_done);
     });
 
     Ok(())
@@ -10042,18 +10049,29 @@ fn show_dictation_overlay(app: &tauri::AppHandle) {
 
 // ── Live transcript commands ─────────────────────────────────
 
-/// RAII guard that resets the live_transcript_active flag on drop (even on panic).
-struct LiveActiveGuard(Arc<AtomicBool>);
+/// RAII guard that resets the live_transcript_active flag on drop (even on
+/// panic) and then re-syncs the tray. The tray sync MUST run after the flag
+/// flips back to false or `sync_tray_state` would still derive `Live` and
+/// leave the menu reflecting an inactive session. Owning the `AppHandle`
+/// here keeps the ordering correct in one place.
+struct LiveActiveGuard {
+    active: Arc<AtomicBool>,
+    app: tauri::AppHandle,
+}
 impl Drop for LiveActiveGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.active.store(false, Ordering::SeqCst);
+        crate::sync_tray_state(&self.app);
     }
 }
 
 /// Shared live transcript session runner. Spawned on a background thread by both
 /// cmd_start_live_transcript and handle_live_shortcut_event.
 fn run_live_session(app: tauri::AppHandle, active: Arc<AtomicBool>, stop_flag: Arc<AtomicBool>) {
-    let _guard = LiveActiveGuard(active);
+    let _guard = LiveActiveGuard {
+        active,
+        app: app.clone(),
+    };
 
     let mut config = Config::load();
     // Re-validate the pinned input device for mid-session disconnects
@@ -10084,7 +10102,9 @@ fn run_live_session(app: tauri::AppHandle, active: Arc<AtomicBool>, stop_flag: A
         }
     });
 
-    crate::update_tray_state_with_mode(&app, true, true);
+    // The live flag was set by `try_acquire_live` before run_live_session
+    // was spawned; sync the tray to reflect the just-started session.
+    crate::sync_tray_state(&app);
 
     let result = minutes_core::live_transcript::run(
         stop_flag.clone(),
@@ -10124,10 +10144,53 @@ fn run_live_session(app: tauri::AppHandle, active: Arc<AtomicBool>, stop_flag: A
         }
     }
 
-    crate::update_tray_state(&app, false);
+    // Tray sync fires from `LiveActiveGuard`'s Drop once this function
+    // returns and the guard sets `live_transcript_active` to false. Calling
+    // sync_tray_state here would still see the flag as true and re-render
+    // the menu in Live mode.
 }
 
 /// Try to acquire the live transcript state. Returns Err with a message on conflict.
+/// RAII guard that resets the dictation_active flag on drop (even on panic)
+/// and re-syncs the tray. Same shape as `LiveActiveGuard` — owning the
+/// `AppHandle` keeps the flag-flip-then-sync ordering correct in one place.
+struct DictationActiveGuard {
+    active: Arc<AtomicBool>,
+    app: tauri::AppHandle,
+}
+impl Drop for DictationActiveGuard {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::SeqCst);
+        crate::sync_tray_state(&self.app);
+    }
+}
+
+/// Try to acquire the dictation state. Mirrors `try_acquire_live`: gates
+/// against recording / live / dictation, uses `compare_exchange` to close
+/// the load→store TOCTOU window in the old code (`load` at the top of
+/// `start_dictation_session`, `store` after overlay setup), and rolls back
+/// the flag on subsequent failure cases.
+fn try_acquire_dictation(state: &AppState) -> Result<(), String> {
+    if recording_active(&state.recording) {
+        return Err("Recording in progress — stop recording before dictating".into());
+    }
+    if state.live_transcript_active.load(Ordering::Relaxed) {
+        return Err("Live transcript in progress — stop it before dictating".into());
+    }
+    if state
+        .dictation_active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("Dictation is already in progress.".into());
+    }
+    if dictation_pid_active() {
+        state.dictation_active.store(false, Ordering::SeqCst);
+        return Err("Dictation is running in another Minutes process.".into());
+    }
+    Ok(())
+}
+
 fn try_acquire_live(state: &AppState) -> Result<(), String> {
     if state
         .live_transcript_active
@@ -10901,13 +10964,19 @@ fn start_dictation_session(
 ) -> Result<String, String> {
     let state = app.state::<AppState>();
 
-    if state.recording.load(Ordering::Relaxed) {
-        return Err("Recording in progress — stop recording before dictating".into());
-    }
-
-    if state.dictation_active.load(Ordering::Relaxed) || dictation_pid_active() {
-        return Err("Dictation is already in progress.".into());
-    }
+    // Acquire BEFORE any side effects (overlay, focus capture, emits). The
+    // previous load→store gap could let two starts race past the load and
+    // both fall into overlay setup. `try_acquire_dictation` uses
+    // compare_exchange and also gates against recording / live transcript.
+    try_acquire_dictation(&state)?;
+    // From here on, any early exit must drop `tray_guard` so the flag
+    // resets and the tray re-syncs. The guard is moved into the spawned
+    // thread once we get there; if any panic happens between here and the
+    // spawn it'll drop on the local stack and clean up.
+    let tray_guard = DictationActiveGuard {
+        active: Arc::clone(&state.dictation_active),
+        app: app.clone(),
+    };
 
     let dictation_target_context = take_pending_dictation_target(&state)
         .or_else(crate::text_insertion::capture_active_target_context);
@@ -10938,16 +11007,21 @@ fn start_dictation_session(
     app.emit("dictation:state", "loading").ok();
 
     state.dictation_stop_flag.store(false, Ordering::Relaxed);
-    state.dictation_active.store(true, Ordering::Relaxed);
+    // dictation_active is already true from try_acquire_dictation; sync the
+    // tray so the menu reflects the just-started session.
+    crate::sync_tray_state(app);
 
     let _ = capture_style;
 
     let app_clone = app.clone();
     let stop_flag = Arc::clone(&state.dictation_stop_flag);
-    let dictation_active = Arc::clone(&state.dictation_active);
     let final_output_emitted = Arc::new(AtomicBool::new(false));
     let dictation_target_context_for_thread = dictation_target_context.clone();
     std::thread::spawn(move || {
+        // Move the tray guard into the thread. When this closure exits
+        // (normal return, error, or panic) the guard drops, which stores
+        // `dictation_active = false` and re-syncs the tray (idle).
+        let _tray_guard = tray_guard;
         let mut config = Config::load();
         // Re-validate the pinned input device for mid-session
         // disconnects (#189). In-memory only; startup-side persistence
@@ -11063,7 +11137,8 @@ fn start_dictation_session(
             },
         );
 
-        dictation_active.store(false, Ordering::Relaxed);
+        // dictation_active is flipped to false (and the tray re-syncs)
+        // when `_tray_guard` drops on closure exit. See `DictationActiveGuard`.
         match result {
             Ok(()) => {
                 // Session ended normally (silence timeout or yield).

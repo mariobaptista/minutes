@@ -328,7 +328,7 @@ pub fn show_terminal_window(app: &tauri::AppHandle, session_id: &str, title: &st
 /// via `app.manage()` after menu construction so any recording-state change
 /// (regardless of source — tray click, main window, hotkey, CLI, call-detect,
 /// palette) can flip the menu items' enabled state through the central
-/// `update_tray_state_with_mode` function.
+/// `sync_tray_state` function.
 ///
 /// Without this, items built with `MenuItem::with_id(..., enabled, ...)` are
 /// frozen in their startup state because `enabled` is only consulted at
@@ -344,53 +344,149 @@ pub struct TrayMenuHandles {
     pub stop: tauri::menu::MenuItem<tauri::Wry>,
 }
 
-/// Update tray to reflect recording state.
+/// The active "recording-class" activity that the tray reflects. Each
+/// acquisition path (`launch_recording`, `try_acquire_live`,
+/// `try_acquire_dictation`) gates against the other two — but those gates
+/// are check-then-CAS across separate atomics, so under concurrent starts
+/// the cross-mode race window can briefly leave two flags set. The core
+/// layer still serializes the actual capture session via PID + flock
+/// (see `minutes_core::pid` and the run-start checks in `dictation::run` /
+/// `live_transcript::run`), so the underlying audio stream is exclusive
+/// even when the in-app atomics drift. The losing session's flag clears
+/// when its `run` fails and its RAII guard drops, re-syncing the tray.
 ///
-/// Updates the tray icon, tooltip, and (when `TrayMenuHandles` is registered)
-/// the enabled state of the record / quick-thought / stop menu items.
-pub fn update_tray_state(app: &tauri::AppHandle, is_recording: bool) {
-    update_tray_state_with_mode(app, is_recording, false);
+/// `derive_tray_activity` defines a deterministic priority order
+/// (Recording > Live > Dictation > Idle) so the tray renders coherently
+/// during the brief drift window. Properly closing the cross-mode race
+/// needs a single serialized lifecycle primitive (e.g. an `AtomicU8` mode
+/// CAS or a mutex around mode reservation) — out of scope here, tracked
+/// for follow-up.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TrayActivity {
+    Idle,
+    Recording,
+    Live,
+    Dictation,
 }
 
-pub fn update_tray_state_with_mode(app: &tauri::AppHandle, is_active: bool, is_live: bool) {
-    if let Some(tray) = app.tray_by_id("minutes-tray") {
-        let icon_bytes: &[u8] = if is_live {
-            include_bytes!("../icons/icon-live.png")
-        } else if is_active {
-            include_bytes!("../icons/icon-recording.png")
-        } else {
-            include_bytes!("../icons/icon-tray.png")
-        };
-        if let Ok(icon) = tauri::image::Image::from_bytes(icon_bytes) {
-            tray.set_icon(Some(icon)).ok();
-            tray.set_icon_as_template(!is_active).ok();
-        }
-        let tooltip = if is_live {
-            "Minutes — Live Transcribing..."
-        } else if is_active {
-            "Minutes — Recording..."
-        } else {
-            "Minutes"
-        };
-        tray.set_tooltip(Some(tooltip)).ok();
+impl TrayActivity {
+    fn is_active(self) -> bool {
+        !matches!(self, Self::Idle)
     }
 
-    // Sync tray menu item enabled state with the recording lifecycle. Tray
-    // callback handlers used to do this on their own immediate paths, but
-    // any non-tray-initiated recording (main window, hotkey, CLI, call-detect,
+    fn icon_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Idle => include_bytes!("../icons/icon-tray.png"),
+            Self::Recording | Self::Dictation => include_bytes!("../icons/icon-recording.png"),
+            Self::Live => include_bytes!("../icons/icon-live.png"),
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Idle => "Minutes",
+            Self::Recording => "Minutes — Recording...",
+            Self::Live => "Minutes — Live Transcribing...",
+            Self::Dictation => "Minutes — Dictating...",
+        }
+    }
+
+    fn stop_label(self) -> &'static str {
+        match self {
+            // Idle reuses the construction-time label at main.rs ~1535 so
+            // the menu reads "Stop Recording" by default before any session.
+            Self::Idle | Self::Recording => "Stop Recording",
+            Self::Live => "Stop Live Transcript",
+            Self::Dictation => "Stop Dictation",
+        }
+    }
+
+    fn palette_source(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Recording => "recording",
+            Self::Live => "live-transcript",
+            Self::Dictation => "dictation",
+        }
+    }
+}
+
+/// Snapshot of the lifecycle flags used to derive `TrayActivity`. Capturing
+/// once per sync keeps derivation deterministic if a flag flips between
+/// reads, and makes the derivation testable as a pure function.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TrayStateSnapshot {
+    pub recording: bool,
+    pub live: bool,
+    pub dictation: bool,
+}
+
+/// Derive the tray activity from a state snapshot. Pure function; tested in
+/// the module's `#[cfg(test)]` block. Priority is Recording > Live >
+/// Dictation > Idle so an external CLI recording (surfaced through
+/// `recording_active` PID check) keeps the tray rendering as recording even
+/// if an in-app dictation flag is somehow also set.
+pub fn derive_tray_activity(snapshot: TrayStateSnapshot) -> TrayActivity {
+    if snapshot.recording {
+        TrayActivity::Recording
+    } else if snapshot.live {
+        TrayActivity::Live
+    } else if snapshot.dictation {
+        TrayActivity::Dictation
+    } else {
+        TrayActivity::Idle
+    }
+}
+
+fn snapshot_tray_state(app: &tauri::AppHandle) -> TrayStateSnapshot {
+    match app.try_state::<commands::AppState>() {
+        Some(state) => TrayStateSnapshot {
+            // Use the PID-aware helper so external/CLI recordings keep the
+            // tray showing Recording at app launch (codex plan-review catch).
+            recording: commands::recording_active(&state.recording),
+            live: state.live_transcript_active.load(Ordering::Relaxed),
+            dictation: state.dictation_active.load(Ordering::Relaxed),
+        },
+        None => TrayStateSnapshot {
+            recording: false,
+            live: false,
+            dictation: false,
+        },
+    }
+}
+
+fn apply_tray_activity(app: &tauri::AppHandle, activity: TrayActivity) {
+    if let Some(tray) = app.tray_by_id("minutes-tray") {
+        if let Ok(icon) = tauri::image::Image::from_bytes(activity.icon_bytes()) {
+            tray.set_icon(Some(icon)).ok();
+            // Active-state icons (recording/live/dictation) render with
+            // template tinting OFF so their colored dot is visible; idle
+            // uses the template so the M adopts the menu-bar tint.
+            tray.set_icon_as_template(!activity.is_active()).ok();
+        }
+        tray.set_tooltip(Some(activity.tooltip())).ok();
+    }
+
+    // Sync tray menu item enabled state with the lifecycle. Tray callback
+    // handlers used to do this on their own immediate paths, but any
+    // non-tray-initiated recording (main window, hotkey, CLI, call-detect,
     // palette) bypassed those callbacks and left the menu stuck in its
-    // construction-time state. Centralizing here fixes issue #223 in one
-    // hook and removes a class of race between the tray callback's
-    // post-async-work cleanup and external state updates.
+    // construction-time state. Centralizing here fixes #223 (and the
+    // dictation follow-on) and removes a class of race between tray
+    // callback post-async-work cleanup and external state updates.
     //
     // No-op + warn if the handles aren't registered (programmer error caught
     // at the first recording state transition — quieter than panic, louder
     // than silent regression).
     match app.try_state::<TrayMenuHandles>() {
         Some(handles) => {
-            handles.record.set_enabled(!is_active).ok();
-            handles.quick_thought.set_enabled(!is_active).ok();
-            handles.stop.set_enabled(is_active).ok();
+            handles.record.set_enabled(!activity.is_active()).ok();
+            handles
+                .quick_thought
+                .set_enabled(!activity.is_active())
+                .ok();
+            handles.stop.set_enabled(activity.is_active()).ok();
+            handles.stop.set_text(activity.stop_label()).ok();
         }
         None => {
             tracing::warn!(
@@ -400,16 +496,26 @@ pub fn update_tray_state_with_mode(app: &tauri::AppHandle, is_active: bool, is_l
         }
     }
 
-    // Notify the palette overlay that recording / live state changed
-    // so it can re-fetch its visible command list. Dictation transitions
-    // emit `palette:refresh` separately from `commands.rs`.
+    // Notify the palette overlay that lifecycle state changed so it can
+    // re-fetch its visible command list. The source string lets the palette
+    // distinguish recording / live / dictation transitions.
     let _ = app.emit(
         "palette:refresh",
         serde_json::json!({
-            "source": if is_live { "live-transcript" } else { "recording" },
-            "active": is_active,
+            "source": activity.palette_source(),
+            "active": activity.is_active(),
         }),
     );
+}
+
+/// Re-sync the tray (icon, tooltip, menu enabled/labels, palette refresh)
+/// from the current AppState lifecycle flags. Callers must mutate
+/// recording / live / dictation flags BEFORE invoking this — the function
+/// reads, it does not write.
+pub fn sync_tray_state(app: &tauri::AppHandle) {
+    let snapshot = snapshot_tray_state(app);
+    let activity = derive_tray_activity(snapshot);
+    apply_tray_activity(app, activity);
 }
 
 // ── Auto-updater ────────────────────────────────────────────
@@ -1649,7 +1755,7 @@ fn main() {
                                 return;
                             }
                             // Transitional text only — enabled-state flips
-                            // flow through update_tray_state so they cannot
+                            // flow through sync_tray_state so they cannot
                             // race against external (non-tray) state changes
                             // (issue #223 / codex race-condition catch).
                             rec_item.set_text("Starting...").ok();
@@ -1670,14 +1776,15 @@ fn main() {
                                     None,
                                 );
                                 // Reset transitional text only. Do NOT call
-                                // update_tray_state(false) here — `launch_recording`
-                                // is non-blocking; it spawns the actual recorder
-                                // thread which manages its own update_tray_state
-                                // calls through the recording lifecycle. Calling
-                                // update_tray_state(false) here would race against
-                                // the inner recorder's update_tray_state(true) and
-                                // could leave the menu showing record-enabled
-                                // mid-recording (codex diff-review attack #1).
+                                // sync_tray_state here — `launch_recording`
+                                // is non-blocking; it spawns the actual
+                                // recorder thread which fires its own
+                                // sync_tray_state calls through the
+                                // recording lifecycle. Calling sync here
+                                // would race against the inner recorder's
+                                // sync and could leave the menu showing
+                                // record-enabled mid-recording (codex
+                                // diff-review attack #1).
                                 ri.set_text("Start Recording").ok();
                             });
                         }
@@ -1713,25 +1820,28 @@ fn main() {
                         }
                         "stop" => {
                             // The Stop menu item is enabled whenever ANY
-                            // recording-class state is active: recording proper
-                            // OR live transcript. Route to whichever is active.
-                            // Codex diff-review attack #5: live transcript has a
-                            // separate stop path (`cmd_stop_live_transcript`)
-                            // and `request_stop` only targets recording, so
-                            // calling request_stop while only live transcript
-                            // is active would no-op and leave the user with a
-                            // button that did nothing. (Dictation is a separate
-                            // bug class — tracked as follow-up.)
+                            // recording-class state is active: recording
+                            // proper, live transcript, OR dictation. Route to
+                            // the active flow. Each has a distinct stop path:
+                            //   - recording → `commands::request_stop`
+                            //   - live      → `commands::cmd_stop_live_transcript`
+                            //   - dictation → `commands::cmd_stop_dictation`
+                            // Priority order matches `derive_tray_activity`
+                            // (Recording > Live > Dictation) so behavior is
+                            // deterministic if two flags are somehow both
+                            // true.
                             let state = app.state::<commands::AppState>();
-                            let live_active = state.live_transcript_active.load(Ordering::Relaxed);
                             let recording_was_active = commands::recording_active(&recording);
+                            let live_active = state.live_transcript_active.load(Ordering::Relaxed);
+                            let dictation_was_active =
+                                state.dictation_active.load(Ordering::Relaxed);
 
-                            // Try recording stop first; if no recording is
-                            // active, try live transcript stop.
                             let stop_ok = if recording_was_active {
                                 commands::request_stop(&recording, &stop).is_ok()
                             } else if live_active {
                                 commands::cmd_stop_live_transcript(state).is_ok()
+                            } else if dictation_was_active {
+                                commands::cmd_stop_dictation(state).is_ok()
                             } else {
                                 false
                             };
@@ -1744,7 +1854,10 @@ fn main() {
                             // arm. Disabling stop immediately to prevent
                             // double-click is intentional and stays here
                             // (transient UX affordance, separate from
-                            // steady-state sync).
+                            // steady-state sync). The steady-state sync that
+                            // re-renders the idle label fires when the
+                            // active session's RAII guard drops and triggers
+                            // `sync_tray_state` (Live/DictationActiveGuard).
                             rec_item.set_text("Stopping...").ok();
                             quick_item.set_text("Quick Thought").ok();
                             stp_item.set_enabled(false).ok();
@@ -1758,16 +1871,20 @@ fn main() {
                                     ) {
                                         ri.set_text("Start Recording").ok();
                                         qi.set_text("Quick Thought").ok();
-                                        update_tray_state(&app_done, false);
+                                        sync_tray_state(&app_done);
                                     }
                                 } else {
-                                    // Live transcript path: cmd_stop_live_transcript
-                                    // sets the stop flag; the live session's own
-                                    // run_live_session calls update_tray_state(false)
-                                    // when it tears down. Just reset transitional
-                                    // text here; do NOT call update_tray_state
-                                    // ourselves (would race with the session
-                                    // shutdown — codex attack #1 generalized).
+                                    // Live transcript / dictation paths:
+                                    // both stop calls just flip a flag; the
+                                    // session's own guard (LiveActiveGuard /
+                                    // DictationActiveGuard) calls
+                                    // sync_tray_state when it tears down.
+                                    // Just reset transitional text here; do
+                                    // NOT call sync_tray_state ourselves
+                                    // (would race against the still-true
+                                    // flag and re-enable Stop — codex attack
+                                    // #1 generalized to all flag-based stop
+                                    // paths).
                                     ri.set_text("Start Recording").ok();
                                     qi.set_text("Quick Thought").ok();
                                 }
@@ -1879,7 +1996,7 @@ fn main() {
                         }
                         // Calendar event items — start recording on click.
                         // Mirrors the "record" arm exactly; enabled-state flips
-                        // flow through update_tray_state, not local set_enabled
+                        // flow through sync_tray_state, not local set_enabled
                         // calls (issue #223 / codex diff-review attack #8).
                         "cal-0" | "cal-1" | "cal-2" => {
                             let app_state = app.state::<commands::AppState>();
@@ -1914,7 +2031,7 @@ fn main() {
                 .build(app)?;
 
             // Register tray menu handles BEFORE the initial state sync below
-            // (and before any commands.rs entry-point can fire update_tray_state).
+            // (and before any commands.rs entry-point can fire sync_tray_state).
             // Issue #223: without these handles wired up, the record / stop
             // menu items are frozen in their construction-time enabled state.
             app.manage(TrayMenuHandles {
@@ -1923,7 +2040,11 @@ fn main() {
                 stop: stop_item.clone(),
             });
 
-            update_tray_state(app.handle(), initial_recording);
+            // `sync_tray_state` reads the PID-aware `recording_active`
+            // helper and the in-app live/dictation flags, so an external
+            // CLI recording active at app launch keeps the tray rendering
+            // as recording (and the menu items reflecting it).
+            sync_tray_state(app.handle());
 
             // Start call detection background loop
             if commands::supports_call_detection() {
@@ -2171,4 +2292,95 @@ fn main() {
             tauri::RunEvent::Exit => cleanup_before_process_exit(app),
             _ => {}
         });
+}
+
+#[cfg(test)]
+mod tray_activity_tests {
+    use super::{derive_tray_activity, TrayActivity, TrayStateSnapshot};
+
+    fn snap(recording: bool, live: bool, dictation: bool) -> TrayStateSnapshot {
+        TrayStateSnapshot {
+            recording,
+            live,
+            dictation,
+        }
+    }
+
+    #[test]
+    fn idle_when_all_flags_false() {
+        assert_eq!(
+            derive_tray_activity(snap(false, false, false)),
+            TrayActivity::Idle
+        );
+    }
+
+    #[test]
+    fn recording_takes_priority_over_live_and_dictation() {
+        // Recording > Live > Dictation. The acquisition gates are
+        // check-then-CAS across separate atomics, so concurrent starts
+        // can land in a transient double-true state until the loser's
+        // session fails at the PID/flock layer in core and its RAII
+        // guard re-syncs the tray. `recording_active` can also be true
+        // from an external CLI PID independent of the in-app flags. In
+        // any drift scenario the tray must render deterministically.
+        assert_eq!(
+            derive_tray_activity(snap(true, true, true)),
+            TrayActivity::Recording
+        );
+        assert_eq!(
+            derive_tray_activity(snap(true, false, true)),
+            TrayActivity::Recording
+        );
+        assert_eq!(
+            derive_tray_activity(snap(true, true, false)),
+            TrayActivity::Recording
+        );
+    }
+
+    #[test]
+    fn live_beats_dictation_when_recording_is_false() {
+        assert_eq!(
+            derive_tray_activity(snap(false, true, true)),
+            TrayActivity::Live
+        );
+        assert_eq!(
+            derive_tray_activity(snap(false, true, false)),
+            TrayActivity::Live
+        );
+    }
+
+    #[test]
+    fn dictation_when_only_dictation_set() {
+        assert_eq!(
+            derive_tray_activity(snap(false, false, true)),
+            TrayActivity::Dictation
+        );
+    }
+
+    #[test]
+    fn is_active_only_for_non_idle() {
+        assert!(!TrayActivity::Idle.is_active());
+        assert!(TrayActivity::Recording.is_active());
+        assert!(TrayActivity::Live.is_active());
+        assert!(TrayActivity::Dictation.is_active());
+    }
+
+    #[test]
+    fn stop_label_per_activity() {
+        // Idle keeps the construction-time label so the menu reads "Stop
+        // Recording" before any session starts; the active states each
+        // disambiguate which flow Stop will target.
+        assert_eq!(TrayActivity::Idle.stop_label(), "Stop Recording");
+        assert_eq!(TrayActivity::Recording.stop_label(), "Stop Recording");
+        assert_eq!(TrayActivity::Live.stop_label(), "Stop Live Transcript");
+        assert_eq!(TrayActivity::Dictation.stop_label(), "Stop Dictation");
+    }
+
+    #[test]
+    fn palette_source_per_activity() {
+        assert_eq!(TrayActivity::Idle.palette_source(), "idle");
+        assert_eq!(TrayActivity::Recording.palette_source(), "recording");
+        assert_eq!(TrayActivity::Live.palette_source(), "live-transcript");
+        assert_eq!(TrayActivity::Dictation.palette_source(), "dictation");
+    }
 }
