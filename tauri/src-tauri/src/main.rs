@@ -1221,6 +1221,14 @@ fn main() {
     // Load with first-run and upgrade migrations so palette defaults
     // stay enabled across upgrades and fresh installs.
     let mut startup_config_snapshot = minutes_core::config::Config::load_with_migrations();
+    // Apply the same directory/privacy bootstrap the CLI uses before the
+    // desktop app creates logs, scratch audio, or other runtime state.
+    if let Err(e) = startup_config_snapshot.ensure_dirs() {
+        tracing::warn!(
+            "failed to ensure Minutes directories on desktop startup: {}",
+            e
+        );
+    }
     // Auto-heal a stale `recording.device` pin: when the configured
     // input device (USB mixer, Bluetooth headset, virtual loopback) is
     // unplugged before launch, clear it and fall back to the system
