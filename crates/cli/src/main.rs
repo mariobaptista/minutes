@@ -5393,6 +5393,45 @@ fn cmd_setup_parakeet(model: &str) -> Result<()> {
     eprintln!("  engine = \"parakeet\"");
     eprintln!("  parakeet_model = \"{}\"", model);
     eprintln!("  parakeet_vocab = \"{}\"", dest_vocab_name);
+    // Print parakeet_binary too. Users who installed parakeet.cpp from
+    // source typically land at ~/.local/bin/parakeet, which is reachable
+    // from a Terminal-launched CLI but NOT from a Finder/Spotlight/Dock-
+    // launched desktop app (different PATH). Spelling the binary out in
+    // the config footer prevents the "minutes works in terminal, app
+    // says binary-not-found" class of issue.
+    eprintln!(
+        "  parakeet_binary = \"<absolute path to parakeet, e.g. /Users/you/.local/bin/parakeet>\""
+    );
+
+    // Feature-flag visibility check. If this binary was compiled without
+    // `--features parakeet`, every config key above is silently inert at
+    // runtime and the engine falls back to whisper. The setup command
+    // itself runs to completion because download + binary resolution don't
+    // require the feature, so without this warning a user can follow every
+    // step successfully and still wonder why parakeet isn't transcribing.
+    //
+    // Tagged release artifacts (the DMG and the per-platform CLI binaries
+    // built by .github/workflows/release-{macos,cli}.yml) ship WITH the
+    // feature. The paths that don't are the Homebrew Formula CLI
+    // (`brew install silverstein/tap/minutes`, which runs bare
+    // `cargo install --path crates/cli`) and any source `cargo install`
+    // without `--features parakeet`.
+    //
+    // Confirmed reachable: this function is not feature-gated, so the
+    // warning fires correctly on a whisper-only binary.
+    if !cfg!(feature = "parakeet") {
+        eprintln!();
+        eprintln!("WARNING: this minutes binary was compiled WITHOUT the parakeet feature.");
+        eprintln!("The model and helper binary above are installed, but the runtime will fall");
+        eprintln!("back to whisper regardless of the config keys you just set. To actually use");
+        eprintln!("parakeet, rebuild the CLI with the feature enabled, e.g.:");
+        eprintln!();
+        eprintln!("  cargo install --path crates/cli --features parakeet --root ~/.cargo --force");
+        eprintln!();
+        eprintln!("The downloadable DMG and tagged CLI release binaries do include parakeet.");
+        eprintln!("The Homebrew Formula CLI (`brew install silverstein/tap/minutes`) and bare");
+        eprintln!("`cargo install minutes-cli` runs are the install paths that omit it.");
+    }
 
     Ok(())
 }

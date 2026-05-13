@@ -883,7 +883,11 @@ brew install ffmpeg           # macOS
 minutes setup --diarization
 
 # Alternative: use Parakeet engine (opt-in, local GPU via parakeet.cpp)
-# Requires parakeet.cpp installed: https://github.com/Frikallo/parakeet.cpp
+# Requires (1) parakeet.cpp installed (https://github.com/Frikallo/parakeet.cpp)
+# AND (2) a Minutes CLI compiled with `--features parakeet`. The downloadable
+# DMG and tagged CLI release binaries include the feature; the Homebrew Formula
+# CLI (`brew install silverstein/tap/minutes`) and bare `cargo install minutes-cli`
+# do not. See docs/PARAKEET.md for the source-build walkthrough.
 minutes setup --parakeet                          # Multilingual v3 (tdt-600m, ~1.2GB)
 minutes setup --parakeet --parakeet-model tdt-ctc-110m  # English-only compact model (~220MB)
 # Also installs native Silero VAD weights for the parakeet.cpp --vad path
@@ -940,7 +944,7 @@ brew install --cask silverstein/tap/minutes
 # macOS — build from source
 export CXXFLAGS="-I$(xcrun --show-sdk-path)/usr/include/c++/v1"
 export MACOSX_DEPLOYMENT_TARGET=11.0
-cargo tauri build --bundles app
+cargo tauri build --bundles app --features parakeet,metal
 
 # macOS — local desktop development with stable permissions
 ./scripts/install-dev-app.sh

@@ -93,6 +93,10 @@ cd parakeet.cpp
 make build
 mkdir -p ~/.local/bin
 cp build/bin/parakeet ~/.local/bin/
+# Also copy the warm-sidecar binary. Without this, live mode (minutes live
+# and the recording sidecar) falls back to spawning a fresh subprocess for
+# every utterance — visibly slow because the model has to reload each time.
+cp build/bin/example-server ~/.local/bin/
 
 # 2. Build the Minutes CLI WITH the parakeet feature, then install it
 cd <path/to/your/minutes/checkout>     # e.g. ~/Sites/minutes
@@ -115,6 +119,9 @@ engine = "parakeet"
 parakeet_model = "tdt-600m"
 parakeet_binary = "/Users/<you>/.local/bin/parakeet"
 parakeet_vocab = "tdt-600m.tokenizer.vocab"
+# Reuse the warm example-server socket for live mode instead of spawning
+# a fresh subprocess per utterance. Requires step 1's example-server copy.
+parakeet_sidecar_enabled = true
 ```
 
 That gives you the validated multilingual path:
@@ -276,8 +283,11 @@ make build
 # Replace the check_cxx_source_compiles block with an Apple arm64 short-circuit.
 # See: https://github.com/google/highway/issues/XXXX
 
-# Install the binary
+# Install the binaries
 cp build/bin/parakeet ~/.local/bin/
+# Warm-sidecar binary: required for live mode to reuse a single loaded
+# model across utterances instead of spawning a fresh subprocess each time.
+cp build/bin/example-server ~/.local/bin/
 ```
 
 ## Install Models
@@ -325,6 +335,7 @@ Edit `~/.config/minutes/config.toml`:
 engine = "parakeet"              # "whisper" (default) or "parakeet"
 parakeet_model = "tdt-600m"      # "tdt-ctc-110m" (English) or "tdt-600m" (multilingual v3)
 parakeet_binary = "/Users/you/.local/bin/parakeet"  # Prefer an absolute path for desktop app launches
+parakeet_sidecar_enabled = true  # Reuse warm example-server socket for live mode (requires example-server copied above)
 parakeet_boost_limit = 25        # Experimental: top graph-derived boost phrases (0 disables)
 parakeet_boost_score = 2.0       # Experimental tuning for parakeet.cpp --boost-score
 parakeet_fp16 = true             # Default on macOS Apple Silicon: ~35% faster transcription with lower GPU memory (see docs/designs/parakeet-perf-2026-04-14.md)
