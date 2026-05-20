@@ -658,15 +658,15 @@ fn parakeet_dictation_ready(config: &Config) -> bool {
 
 #[cfg(feature = "whisper")]
 fn finalize_dictation_transcription(
-    config: &Config,
-    final_backend: DictationFinalBackend,
-    final_utterance_samples: &[f32],
+    _config: &Config,
+    _final_backend: DictationFinalBackend,
+    _final_utterance_samples: &[f32],
     streaming: &mut StreamingWhisper,
     whisper_ctx: &whisper_rs::WhisperContext,
 ) -> Option<StreamingResult> {
     #[cfg(target_os = "macos")]
-    if final_backend == DictationFinalBackend::AppleSpeech {
-        match transcribe_utterance_with_apple_speech(final_utterance_samples, config) {
+    if _final_backend == DictationFinalBackend::AppleSpeech {
+        match transcribe_utterance_with_apple_speech(_final_utterance_samples, _config) {
             Ok(Some(result)) => return Some(result),
             Ok(None) => {}
             Err(error) => {
@@ -679,8 +679,8 @@ fn finalize_dictation_transcription(
     }
 
     #[cfg(feature = "parakeet")]
-    if final_backend == DictationFinalBackend::Parakeet {
-        match transcribe_utterance_with_parakeet(final_utterance_samples, config) {
+    if _final_backend == DictationFinalBackend::Parakeet {
+        match transcribe_utterance_with_parakeet(_final_utterance_samples, _config) {
             Ok(Some(result)) => return Some(result),
             Ok(None) => {}
             Err(error) => {

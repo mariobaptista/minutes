@@ -304,14 +304,11 @@ export default function Home() {
         </p>
 
         <p className="mx-auto mt-4 max-w-[620px] text-[14px] leading-6 text-[var(--text-secondary)]">
-          v{MINUTES_RELEASE_VERSION} stops Minutes from writing
-          plausible-looking transcripts that aren't real: macOS native-call
-          captures no longer transcribe to 2x duration garble, near-silent
-          recordings stop emitting &ldquo;(crying)&rdquo; as if it were
-          speech, long silent tails stop filling with YouTube hallucinations,
-          and summarization timeouts now show as{" "}
-          <code className="font-mono text-[12px]">status: degraded</code>{" "}
-          instead of looking complete.
+          v{MINUTES_RELEASE_VERSION} repairs native-call recovery on macOS:
+          usable voice/system stems are queued instead of stranded, recovered{" "}
+          <code className="font-mono text-[12px]">.mov</code> captures stay
+          reprocessable beside the meeting markdown, and cleanup now understands
+          native sidecars without double-counting shared stems.
         </p>
 
         <div className="mt-12">

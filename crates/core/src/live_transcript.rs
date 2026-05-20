@@ -213,6 +213,7 @@ fn emit_live_engine_fallback_warning(source: &'static str, detail: &str) {
     .ok();
 }
 
+#[cfg(all(feature = "whisper", target_os = "macos"))]
 fn emit_apple_speech_fallback_warning(source: &'static str, detail: &str) {
     eprintln!(
         "[minutes] {} (detail: {})",
@@ -1467,7 +1468,7 @@ fn trim_front(buffer: &mut Vec<f32>, max_len: usize) {
     }
 }
 
-#[cfg(feature = "whisper")]
+#[cfg(all(feature = "whisper", any(feature = "parakeet", target_os = "macos")))]
 fn transcribe_with_whisper_for_live_sidecar(
     samples: &[f32],
     whisper_ctx: &whisper_rs::WhisperContext,
@@ -1500,6 +1501,7 @@ fn transcribe_with_whisper_for_live_sidecar(
 /// churn and latency spikes on noisy inputs.
 #[cfg(feature = "parakeet")]
 const PARAKEET_LIVE_MIN_SAMPLES: usize = 16_000; // 1 second at 16kHz
+#[cfg(all(feature = "whisper", target_os = "macos"))]
 const APPLE_SPEECH_LIVE_MIN_SAMPLES: usize = 16_000; // 1 second at 16kHz
 
 #[cfg(feature = "parakeet")]
@@ -1527,6 +1529,7 @@ fn transcribe_with_parakeet_for_live_sidecar(
     }
 }
 
+#[cfg(all(feature = "whisper", target_os = "macos"))]
 fn transcribe_with_apple_speech_for_live_sidecar(
     samples: &[f32],
     config: &Config,
@@ -1538,6 +1541,7 @@ fn transcribe_with_apple_speech_for_live_sidecar(
     )
 }
 
+#[cfg(all(feature = "whisper", target_os = "macos"))]
 fn transcribe_with_apple_speech_for_live_sidecar_impl<F>(
     samples: &[f32],
     config: &Config,
@@ -3784,6 +3788,7 @@ mod tests {
         assert_eq!(result, Some(("whisper transcript".into(), 0.9)));
     }
 
+    #[cfg(all(feature = "whisper", target_os = "macos"))]
     #[test]
     fn apple_speech_live_helper_cleans_up_tempfile_on_error() {
         let cfg = Config::default();
