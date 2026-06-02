@@ -3055,6 +3055,12 @@
       gap: 12px;
     }
 
+    .recovery-header-actions {
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
     .recovery-title {
       font-size: 18px;
       font-family: var(--font-display);
@@ -4737,7 +4743,10 @@
           <div class="recovery-sub" id="recovery-subtitle">Retry preserved captures and watched files that failed to
             process, or open them directly in a folder.</div>
         </div>
-        <button class="btn btn-secondary btn-sm" id="btn-recovery-close">Close</button>
+        <div class="recovery-header-actions">
+          <button class="btn btn-secondary btn-sm" id="btn-recovery-retry-all" disabled>Retry all</button>
+          <button class="btn btn-secondary btn-sm" id="btn-recovery-close">Close</button>
+        </div>
       </div>
       <div class="recovery-scroll" id="recovery-scroll">
         <div class="recovery-empty">No recovery items right now.</div>
@@ -5665,6 +5674,7 @@
     const recoveryCount = document.getElementById('recovery-count');
     const recoveryScroll = document.getElementById('recovery-scroll');
     const recoverySubtitle = document.getElementById('recovery-subtitle');
+    const recoveryRetryAllButton = document.getElementById('btn-recovery-retry-all');
     const recordButton = document.getElementById('btn-record');
     const liveButton = document.getElementById('btn-live');
     const quickThoughtButton = document.getElementById('btn-quick-thought');
@@ -5704,6 +5714,7 @@
     let processingJobs = [];
     let readinessItems = [];
     let recoveryItems = [];
+    let retryingAllRecovery = false;
     let jobsHistory = [];
     let notifyOnCompletion = true;
     let playCaptureCues = true;
@@ -6037,6 +6048,61 @@
       return m > 0 ? `${m}:${String(s).padStart(2, '0')} elapsed` : `${s}s elapsed`;
     }
 
+    function processingJobCounts(jobs) {
+      const list = Array.isArray(jobs) ? jobs : [];
+      return {
+        active: list.filter((job) => job.state !== 'queued').length,
+        queued: list.filter((job) => job.state === 'queued').length,
+        total: list.length,
+      };
+    }
+
+    function processingJobSummaryText(jobs) {
+      const counts = processingJobCounts(jobs);
+      if (!counts.total) return '';
+      const parts = [];
+      if (counts.active) parts.push(`${counts.active} running`);
+      if (counts.queued) parts.push(`${counts.queued} waiting`);
+      return `${parts.join(' · ')}. Jobs run one at a time and continue in the background.`;
+    }
+
+    function queuedJobPosition(job, jobs) {
+      const queued = (Array.isArray(jobs) ? jobs : []).filter((candidate) => candidate.state === 'queued');
+      const index = queued.findIndex((candidate) => candidate.id === job.id);
+      return index >= 0 ? { index: index + 1, total: queued.length } : null;
+    }
+
+    function processingJobDetail(job, jobs) {
+      const counts = processingJobCounts(jobs);
+      const summary = counts.total ? `${counts.active} running · ${counts.queued} waiting` : '';
+      const withSummary = (text) => summary ? `${text} · ${summary}` : text;
+      if (job.error) return job.error;
+      if (job.state === 'queued') {
+        const position = queuedJobPosition(job, jobs);
+        if (position) return withSummary(`Waiting in queue (${position.index} of ${position.total})`);
+        return 'Waiting in queue.';
+      }
+      if (job.state === 'transcribing') {
+        return withSummary(job.stage || 'Transcribing meeting');
+      }
+      if (job.state === 'transcript-only') {
+        return withSummary('Transcript is ready. The richer summary is still running.');
+      }
+      if (job.state === 'complete') return 'Finished processing.';
+      if (job.state === 'needs-review') return 'Transcript needs review. Raw capture was preserved for retry.';
+      return withSummary(job.stage || 'Processing in the background.');
+    }
+
+    function processingJobMeta(job) {
+      const mode = job.mode === 'quick-thought' ? 'Quick thought' : 'Meeting';
+      if (job.state === 'queued') {
+        const elapsed = formatIsoElapsed(job.createdAt);
+        return elapsed ? `${mode} · waiting ${elapsed}` : `${mode} · waiting`;
+      }
+      const elapsed = formatIsoElapsed(job.startedAt || job.createdAt);
+      return elapsed ? `${mode} · running ${elapsed}` : mode;
+    }
+
     function processingStateLabel(job) {
       switch (job.state) {
         case 'queued': return 'Queued';
@@ -6119,10 +6185,7 @@
       }
 
       processingBar.classList.add('has-jobs');
-      processingSummary.textContent =
-        processingJobs.length > 1
-          ? `${processingJobs.length} recordings are cooking in the background.`
-          : 'You can keep recording while this finishes.';
+      processingSummary.textContent = processingJobSummaryText(processingJobs);
 
       for (const job of processingJobs) {
         const card = document.createElement('div');
@@ -6144,13 +6207,11 @@
 
         const detail = document.createElement('div');
         detail.className = 'processing-job-detail';
-        detail.textContent = processingStageText(job);
+        detail.textContent = processingJobDetail(job, processingJobs);
 
         const meta = document.createElement('div');
         meta.className = 'processing-job-meta';
-        const elapsed = formatIsoElapsed(job.startedAt || job.createdAt);
-        const mode = job.mode === 'quick-thought' ? 'Quick thought' : 'Meeting';
-        meta.textContent = elapsed ? `${mode} · ${elapsed}` : mode;
+        meta.textContent = processingJobMeta(job);
 
         card.appendChild(top);
         card.appendChild(detail);
@@ -6195,6 +6256,7 @@
       return date.toLocaleString([], {
         month: 'short',
         day: 'numeric',
+        year: 'numeric',
         hour: 'numeric',
         minute: '2-digit',
       });
@@ -6251,14 +6313,7 @@
 
           const detail = document.createElement('div');
           detail.className = 'recovery-item-detail';
-          detail.textContent = job.error
-            || (job.state === 'complete'
-              ? 'Finished processing.'
-              : job.state === 'needs-review'
-                ? 'Transcript needs review. Raw capture was preserved for retry.'
-                : job.state === 'transcript-only'
-                  ? 'Transcript is ready while enrichment continues.'
-                  : processingStageText(job, 'Queued for background processing.'));
+          detail.textContent = processingJobDetail(job, jobs);
 
           const path = document.createElement('div');
           path.className = 'recovery-item-path';
@@ -6268,7 +6323,11 @@
           meta.className = 'recovery-item-detail';
           meta.style.marginTop = '6px';
           const stamp = formatJobTimestamp(job.finishedAt || job.startedAt || job.createdAt);
-          meta.textContent = `${job.mode === 'quick-thought' ? 'Quick thought' : 'Meeting'}${stamp ? ` · ${stamp}` : ''}${job.wordCount != null ? ` · ${job.wordCount} words` : ''}`;
+          const mode = job.mode === 'quick-thought' ? 'Quick thought' : 'Meeting';
+          const elapsed = ['queued', 'transcribing', 'transcript-only', 'diarizing', 'summarizing', 'saving'].includes(job.state)
+            ? processingJobMeta(job)
+            : mode;
+          meta.textContent = `${elapsed}${stamp ? ` · ${stamp}` : ''}${job.wordCount != null ? ` · ${job.wordCount} words` : ''}`;
 
           const actions = document.createElement('div');
           actions.className = 'recovery-actions';
@@ -6766,6 +6825,64 @@
       recoveryOverlay.classList.remove('active');
     }
 
+    function updateRecoveryRetryAllButton() {
+      const count = recoveryItems.length;
+      recoveryRetryAllButton.hidden = count === 0;
+      recoveryRetryAllButton.disabled = retryingAllRecovery || count === 0;
+      recoveryRetryAllButton.textContent = retryingAllRecovery
+        ? 'Retrying...'
+        : count > 1
+          ? `Retry all (${count})`
+          : 'Retry all';
+    }
+
+    async function retryAllRecoveryItems() {
+      if (retryingAllRecovery || !recoveryItems.length) return;
+      retryingAllRecovery = true;
+      updateRecoveryRetryAllButton();
+      let closeAfterSuccess = false;
+      let delayReset = false;
+
+      try {
+        const result = await invoke('cmd_retry_all_recovery');
+        const queuedCount = Number(result?.queued || 0);
+        if (result?.failed?.length) {
+          console.error('Retry all recovery failures:', result.failed);
+        }
+        await loadRecoveryItems();
+        startFastPoll();
+        if (queuedCount > 0) {
+          closeAfterSuccess = true;
+          recoveryRetryAllButton.hidden = false;
+          recoveryRetryAllButton.disabled = true;
+          recoveryRetryAllButton.textContent = `Queued ${queuedCount}`;
+          window.setTimeout(() => {
+            closeRecovery();
+            retryingAllRecovery = false;
+            updateRecoveryRetryAllButton();
+          }, 450);
+        } else {
+          delayReset = true;
+          recoveryRetryAllButton.hidden = false;
+          recoveryRetryAllButton.disabled = true;
+          recoveryRetryAllButton.textContent = 'Nothing queued';
+          window.setTimeout(updateRecoveryRetryAllButton, 1200);
+        }
+      } catch (e) {
+        console.error('Retry all recovery:', e);
+        delayReset = true;
+        recoveryRetryAllButton.hidden = false;
+        recoveryRetryAllButton.disabled = true;
+        recoveryRetryAllButton.textContent = 'Retry failed';
+        window.setTimeout(updateRecoveryRetryAllButton, 1200);
+      } finally {
+        if (!closeAfterSuccess) {
+          retryingAllRecovery = false;
+          if (!delayReset) updateRecoveryRetryAllButton();
+        }
+      }
+    }
+
     function permissionReadinessState(row) {
       if (!row) return 'attention';
       if (row.status === 'unsupported') return 'unsupported';
@@ -6976,6 +7093,7 @@
 
       recoveryCount.textContent = recoveryItems.length;
       recoveryButton.classList.toggle('active', recoveryItems.length > 0);
+      updateRecoveryRetryAllButton();
 
       recoveryScroll.replaceChildren();
       if (!recoveryItems.length) {
@@ -6998,7 +7116,7 @@
 
         const title = document.createElement('div');
         title.className = 'recovery-item-title';
-        title.textContent = item.title || 'Recovery item';
+        title.textContent = formatJobTimestamp(item.modified_at) || item.title || 'Recovery item';
 
         const kind = document.createElement('div');
         kind.className = 'recovery-kind';
@@ -7369,6 +7487,7 @@
     recoveryButton.addEventListener('click', () => {
       recoveryOverlay.classList.add('active');
     });
+    recoveryRetryAllButton.addEventListener('click', retryAllRecoveryItems);
     document.getElementById('btn-recovery-close').addEventListener('click', closeRecovery);
     recoveryOverlay.addEventListener('click', (e) => {
       if (e.target === recoveryOverlay) closeRecovery();
