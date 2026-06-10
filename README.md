@@ -107,6 +107,32 @@ minutes stop                                      # Stop from another terminal
 
 **Recording calls (Zoom, Meet, Teams, Webex):** the desktop app captures both your mic and the call's audio natively (ScreenCaptureKit, macOS 15+, no extra software). Grant Screen Recording + Microphone permission and start from the "Call detected" banner; Google Meet and Teams-in-browser need their experimental detection toggles enabled. The CLI (`minutes record`) cannot use native capture, so for command-line call recording you route system audio through BlackHole and a Multi-Output Device. Full setup in [`docs/audio-devices.md`](docs/audio-devices.md).
 
+### Consent disclosure aid
+
+For meetings where participant notice is required, Minutes can show a reminder,
+require an interactive acknowledgement, and stamp the chosen basis into the
+markdown frontmatter. This is a disclosure aid, not advice; ensure everyone
+present consents where required.
+
+```bash
+minutes record --consent verbal_all_parties
+minutes record --consent notice_in_invite --consent-notice "Notice was included in the calendar invite."
+```
+
+```toml
+[consent]
+mode = "remind" # off | remind | require
+disclosure_script = "Heads up — I'm using Minutes to transcribe this conversation locally on my device for my own notes. Let me know if you'd prefer I didn't."
+# default_basis = "notice_in_invite"
+```
+
+When present, artifacts include:
+
+```yaml
+consent: verbal_all_parties
+consent_notice: Heads up — I'm using Minutes to transcribe this conversation locally on my device for my own notes. Let me know if you'd prefer I didn't.
+```
+
 ### Take notes during meetings
 ```bash
 minutes note "Alex wants monthly billing not annual billing"          # Timestamped, feeds into summary
@@ -175,7 +201,7 @@ minutes template show standup                     # Inspect a template
 minutes record --template standup                 # Apply when recording
 minutes process voice-memo.m4a --template voice-memo
 ```
-Templates layer prompt-level guidance on top of the baseline structured extraction (`KEY POINTS`, `DECISIONS`, `ACTION ITEMS`, `OPEN QUESTIONS`, `COMMITMENTS`, `PARTICIPANTS`). Phase 1 ships four bundled templates (`meeting`, `standup`, `1-on-1`, `voice-memo`) and resolves overrides from `.minutes/templates/` (project) and `~/.minutes/templates/` (user). Custom `extract:` schemas, compliance rules, and clinical templates land in later phases — see [`docs/rfcs/0001-templates.md`](docs/rfcs/0001-templates.md).
+Templates layer prompt-level guidance on top of the baseline structured extraction (`KEY POINTS`, `DECISIONS`, `ACTION ITEMS`, `OPEN QUESTIONS`, `COMMITMENTS`, `PARTICIPANTS`). Phase 1 ships four bundled templates (`meeting`, `standup`, `1-on-1`, `voice-memo`) and resolves overrides from `.minutes/templates/` (project) and `~/.minutes/templates/` (user). Custom `extract:` schemas, policy rules, and clinical templates land in later phases — see [`docs/rfcs/0001-templates.md`](docs/rfcs/0001-templates.md).
 
 ### Try it without a mic
 ```bash
