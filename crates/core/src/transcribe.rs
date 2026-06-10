@@ -2144,6 +2144,118 @@ fn build_parakeet_command(
     command
 }
 
+/// Hard ceiling on a single parakeet subprocess invocation. Scaled to 3× the
+/// audio duration so batch jobs on long recordings never trip it, with a floor
+/// generous enough to absorb a cold model load. Without this, a wedged
+/// subprocess blocks its caller forever — the live recording sidecar froze for
+/// 27 minutes mid-meeting on exactly this path (2026-06-10).
+#[cfg(feature = "parakeet")]
+const PARAKEET_SUBPROCESS_TIMEOUT_FLOOR_SECS: u64 = 90;
+#[cfg(feature = "parakeet")]
+const PARAKEET_SUBPROCESS_TIMEOUT_CEIL_SECS: u64 = 1800;
+
+#[cfg(feature = "parakeet")]
+fn parakeet_subprocess_timeout(audio_args: &[&str]) -> std::time::Duration {
+    let audio_secs = audio_args
+        .iter()
+        .filter_map(|arg| estimate_wav_secs(Path::new(arg)))
+        .fold(0.0_f64, f64::max);
+    if audio_secs == 0.0 {
+        // Duration unknown (non-WAV input or unreadable header). Killing a
+        // legitimate long job is worse than waiting longer to declare a wedge,
+        // so fall to the ceiling, not the floor.
+        return std::time::Duration::from_secs(PARAKEET_SUBPROCESS_TIMEOUT_CEIL_SECS);
+    }
+    let scaled = (audio_secs * 3.0).ceil() as u64;
+    std::time::Duration::from_secs(scaled.clamp(
+        PARAKEET_SUBPROCESS_TIMEOUT_FLOOR_SECS,
+        PARAKEET_SUBPROCESS_TIMEOUT_CEIL_SECS,
+    ))
+}
+
+#[cfg(feature = "parakeet")]
+fn estimate_wav_secs(path: &Path) -> Option<f64> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let spec = reader.spec();
+    if spec.sample_rate == 0 {
+        return None;
+    }
+    Some(reader.duration() as f64 / spec.sample_rate as f64)
+}
+
+/// Run a command to completion like `Command::output()`, but kill the child
+/// if it exceeds `timeout`. Pipes are drained on dedicated threads so a child
+/// that fills stdout/stderr can't deadlock against the wait loop. Returns the
+/// output plus whether the child was killed by the timeout.
+#[cfg(feature = "parakeet")]
+fn output_with_timeout(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<(std::process::Output, bool)> {
+    use std::io::Read;
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let mut stdout_pipe = child.stdout.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let mut stderr_pipe = child.stderr.take();
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let status = child.wait()?;
+                    // Don't join the drain threads here: if the child spawned
+                    // helpers that inherited the pipe fds, read_to_end won't
+                    // see EOF until they exit. The caller discards output on
+                    // timeout anyway; let the drains finish detached.
+                    drop(stdout_handle);
+                    drop(stderr_handle);
+                    return Ok((
+                        std::process::Output {
+                            status,
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        },
+                        true,
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    Ok((
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        false,
+    ))
+}
+
 #[cfg(feature = "parakeet")]
 #[allow(clippy::too_many_arguments)]
 fn run_parakeet_command_with_cpu_fallback(
@@ -2160,8 +2272,9 @@ fn run_parakeet_command_with_cpu_fallback(
     hints: &DecodeHints,
 ) -> Result<(std::process::Output, bool), TranscribeError> {
     let mut attempted_gpu = use_gpu;
+    let timeout = parakeet_subprocess_timeout(audio_args);
     loop {
-        let output = build_parakeet_command(
+        let command = build_parakeet_command(
             binary,
             model_str,
             audio_args,
@@ -2173,17 +2286,34 @@ fn run_parakeet_command_with_cpu_fallback(
             vad_threshold,
             config,
             hints,
-        )
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| {
+        );
+        let (output, timed_out) = output_with_timeout(command, timeout).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 TranscribeError::ParakeetNotFound
             } else {
                 TranscribeError::ParakeetFailed(format!("spawn error: {}", e))
             }
         })?;
+
+        if timed_out {
+            tracing::error!(
+                timeout_secs = timeout.as_secs(),
+                gpu = attempted_gpu,
+                "parakeet subprocess exceeded timeout and was killed"
+            );
+            // A wedged GPU run gets the same one-shot CPU retry a crashed GPU
+            // run gets — a Metal hang shouldn't be a harder failure than a
+            // Metal crash.
+            if attempted_gpu {
+                tracing::warn!("parakeet GPU run timed out; retrying once on CPU");
+                attempted_gpu = false;
+                continue;
+            }
+            return Err(TranscribeError::ParakeetFailed(format!(
+                "parakeet subprocess exceeded {}s timeout and was killed",
+                timeout.as_secs()
+            )));
+        }
 
         if output.status.success() {
             return Ok((output, attempted_gpu));
