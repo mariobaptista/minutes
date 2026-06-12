@@ -420,6 +420,17 @@ fn transcribe_chunk_ranges(
     config: &Config,
     hints: &DecodeHints,
 ) -> Result<Option<TranscribeResult>, TranscribeError> {
+    #[cfg(feature = "whisper")]
+    if chunk_transcription_strategy(config) == ChunkTranscriptionStrategy::SharedWhisperContext {
+        return transcribe_whisper_chunk_ranges(
+            samples,
+            chunk_ranges,
+            audio_duration_secs,
+            config,
+            hints,
+        );
+    }
+
     let mut all_lines = Vec::new();
     let mut aggregate = FilterStats {
         audio_duration_secs,
@@ -456,6 +467,98 @@ fn transcribe_chunk_ranges(
         let offset_lines =
             offset_timestamped_lines(chunk_result.text.lines(), chunk_offset_secs, chunk_index);
         let _ = std::fs::remove_file(&tmp_wav);
+
+        aggregate.samples_after_silence_strip += chunk_result.stats.samples_after_silence_strip;
+        aggregate.raw_segments += chunk_result.stats.raw_segments;
+        aggregate.skipped_no_speech += chunk_result.stats.skipped_no_speech;
+        aggregate.after_no_speech_filter += chunk_result.stats.after_no_speech_filter;
+        aggregate.rescued_no_speech += chunk_result.stats.rescued_no_speech;
+        all_lines.extend(offset_lines);
+    }
+
+    if all_lines.is_empty() {
+        return Ok(None);
+    }
+
+    let cleanup = run_transcript_cleanup_pipeline(all_lines);
+    aggregate.after_dedup = cleanup.after(TranscriptCleanupStage::DedupSegments);
+    aggregate.after_interleaved = cleanup.after(TranscriptCleanupStage::DedupInterleaved);
+    aggregate.after_script_filter = cleanup.after(TranscriptCleanupStage::StripForeignScript);
+    aggregate.after_noise_markers = cleanup.after(TranscriptCleanupStage::CollapseNoiseMarkers);
+    aggregate.after_trailing_trim = cleanup.after(TranscriptCleanupStage::TrimTrailingNoise);
+
+    let text = if cleanup.lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", cleanup.lines.join("\n"))
+    };
+    aggregate.final_words = text.split_whitespace().count();
+
+    Ok(Some(TranscribeResult {
+        text,
+        stats: aggregate,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
+enum ChunkTranscriptionStrategy {
+    SharedWhisperContext,
+    DispatchPerChunk,
+}
+
+#[cfg_attr(not(feature = "whisper"), allow(dead_code))]
+fn chunk_transcription_strategy(config: &Config) -> ChunkTranscriptionStrategy {
+    if cfg!(feature = "whisper") && config.transcription.engine == "whisper" {
+        ChunkTranscriptionStrategy::SharedWhisperContext
+    } else {
+        ChunkTranscriptionStrategy::DispatchPerChunk
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_whisper_chunk_ranges(
+    samples: &[f32],
+    chunk_ranges: &[(usize, usize)],
+    audio_duration_secs: f64,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<Option<TranscribeResult>, TranscribeError> {
+    let ctx = load_whisper_context(config)?;
+    let mut all_lines = Vec::new();
+    let mut aggregate = FilterStats {
+        audio_duration_secs,
+        ..Default::default()
+    };
+
+    for (chunk_index, (start_sample, end_sample)) in chunk_ranges.iter().enumerate() {
+        let chunk_samples = &samples[*start_sample..*end_sample];
+        if chunk_samples.is_empty() {
+            continue;
+        }
+
+        let chunk_result = match transcribe_whisper_samples(
+            &ctx,
+            chunk_samples,
+            Path::new("<vad-chunk>"),
+            config,
+            hints,
+        ) {
+            Ok(result) => result,
+            Err(TranscribeError::EmptyAudio) | Err(TranscribeError::EmptyTranscript(_)) => {
+                tracing::debug!(
+                    chunk_index,
+                    start_sample,
+                    end_sample,
+                    "skipping empty VAD chunk"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let chunk_offset_secs = *start_sample as f64 / 16000.0;
+        let offset_lines =
+            offset_timestamped_lines(chunk_result.text.lines(), chunk_offset_secs, chunk_index);
 
         aggregate.samples_after_silence_strip += chunk_result.stats.samples_after_silence_strip;
         aggregate.raw_segments += chunk_result.stats.raw_segments;
@@ -534,90 +637,20 @@ fn transcribe_whisper_dispatch(
     config: &Config,
     hints: &DecodeHints,
 ) -> Result<TranscribeResult, TranscribeError> {
-    let mut stats = FilterStats::default();
-
     // Step 1: Load audio as 16kHz mono f32 PCM samples
     let samples = load_audio_samples(audio_path)?;
-    stats.audio_duration_secs = samples.len() as f64 / 16000.0;
-
-    if samples.is_empty() {
-        return Err(TranscribeError::EmptyAudio);
-    }
-
-    // Step 1b: Noise reduction (requires denoise feature + config enabled)
-    #[cfg(feature = "denoise")]
-    let samples = if config.transcription.noise_reduction {
-        denoise_audio(&samples, 16000)
-    } else {
-        samples
-    };
-
-    // Step 2: Silence handling.
-    // If Silero VAD model is available, whisper handles silence internally via
-    // integrated VAD (set in default_whisper_params). Otherwise, fall back to
-    // energy-based silence stripping to prevent hallucination loops (issue #21).
-    #[cfg(feature = "whisper")]
-    let use_integrated_vad = resolve_vad_model_path(config).is_some();
-    #[cfg(not(feature = "whisper"))]
-    let use_integrated_vad = false;
-
-    let samples = if use_integrated_vad {
-        tracing::debug!("Silero VAD available — skipping energy-based silence stripping");
-        samples
-    } else {
-        strip_silence(&samples, 16000)
-    };
-    stats.samples_after_silence_strip = samples.len();
-
-    if samples.is_empty() {
-        tracing::warn!(
-            audio_duration_secs = stats.audio_duration_secs,
-            "silence stripping removed all audio — entire recording was below energy threshold"
-        );
-        return Err(TranscribeError::EmptyAudio);
-    }
 
     // Step 3: Transcribe
     #[cfg(feature = "whisper")]
     {
-        let result = transcribe_with_whisper(&samples, audio_path, config, stats, false, hints)?;
-
-        // Step 4: Auto-retry without VAD if the first attempt blanked on long audio.
-        // Silero VAD can be too aggressive on certain acoustic profiles or non-English
-        // audio, causing whisper to see almost no speech segments. Retrying with
-        // energy-based silence stripping gives whisper the full audio.
-        if result.stats.final_words == 0
-            && use_integrated_vad
-            && result.stats.audio_duration_secs > 60.0
-        {
-            tracing::warn!(
-                audio_secs = format!("{:.0}", result.stats.audio_duration_secs),
-                raw_segments = result.stats.raw_segments,
-                "blank transcript from long audio with VAD — retrying without VAD"
-            );
-            let mut retry_stats = FilterStats {
-                audio_duration_secs: result.stats.audio_duration_secs,
-                ..Default::default()
-            };
-            let stripped = strip_silence(&samples, 16000);
-            retry_stats.samples_after_silence_strip = stripped.len();
-            if !stripped.is_empty() {
-                return transcribe_with_whisper(
-                    &stripped,
-                    audio_path,
-                    config,
-                    retry_stats,
-                    true,
-                    hints,
-                );
-            }
-        }
-
-        Ok(result)
+        let ctx = load_whisper_context(config)?;
+        transcribe_whisper_samples(&ctx, &samples, audio_path, config, hints)
     }
 
     #[cfg(not(feature = "whisper"))]
     {
+        let mut stats = FilterStats::default();
+        stats.audio_duration_secs = samples.len() as f64 / 16000.0;
         let _ = config; // suppress unused warning
         let _ = hints; // only used when the whisper feature is enabled
         let duration_secs = samples.len() as f64 / 16000.0;
@@ -732,12 +765,112 @@ pub(crate) fn whisper_context_params() -> whisper_rs::WhisperContextParameters<'
     params
 }
 
+#[cfg(feature = "whisper")]
+fn load_whisper_context(config: &Config) -> Result<whisper_rs::WhisperContext, TranscribeError> {
+    let model_path = resolve_model_path(config)?;
+    tracing::info!(model = %model_path.display(), "loading whisper model");
+
+    whisper_rs::WhisperContext::new_with_params(
+        model_path
+            .to_str()
+            .ok_or_else(|| TranscribeError::ModelLoadError("invalid model path encoding".into()))?,
+        whisper_context_params(),
+    )
+    .map_err(|e| TranscribeError::ModelLoadError(format!("{}", e)))
+}
+
+#[cfg(feature = "whisper")]
+fn transcribe_whisper_samples(
+    ctx: &whisper_rs::WhisperContext,
+    samples: &[f32],
+    audio_path: &Path,
+    config: &Config,
+    hints: &DecodeHints,
+) -> Result<TranscribeResult, TranscribeError> {
+    let mut stats = FilterStats {
+        audio_duration_secs: samples.len() as f64 / 16000.0,
+        ..Default::default()
+    };
+
+    if samples.is_empty() {
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    // Noise reduction (requires denoise feature + config enabled).
+    #[cfg(feature = "denoise")]
+    let samples = if config.transcription.noise_reduction {
+        denoise_audio(samples, 16000)
+    } else {
+        samples.to_vec()
+    };
+    #[cfg(not(feature = "denoise"))]
+    let samples = samples.to_vec();
+
+    // If Silero VAD model is available, whisper handles silence internally via
+    // integrated VAD (set in default_whisper_params). Otherwise, fall back to
+    // energy-based silence stripping to prevent hallucination loops (issue #21).
+    let use_integrated_vad = resolve_vad_model_path(config).is_some();
+
+    let samples = if use_integrated_vad {
+        tracing::debug!("Silero VAD available — skipping energy-based silence stripping");
+        samples
+    } else {
+        strip_silence(&samples, 16000)
+    };
+    stats.samples_after_silence_strip = samples.len();
+
+    if samples.is_empty() {
+        tracing::warn!(
+            audio_duration_secs = stats.audio_duration_secs,
+            "silence stripping removed all audio — entire recording was below energy threshold"
+        );
+        return Err(TranscribeError::EmptyAudio);
+    }
+
+    let result = transcribe_with_whisper(ctx, &samples, audio_path, config, stats, false, hints)?;
+
+    // Auto-retry without VAD if the first attempt blanked on long audio.
+    // Silero VAD can be too aggressive on certain acoustic profiles or non-English
+    // audio, causing whisper to see almost no speech segments. Retrying with
+    // energy-based silence stripping gives whisper the full audio.
+    if result.stats.final_words == 0
+        && use_integrated_vad
+        && result.stats.audio_duration_secs > 60.0
+    {
+        tracing::warn!(
+            audio_secs = format!("{:.0}", result.stats.audio_duration_secs),
+            raw_segments = result.stats.raw_segments,
+            "blank transcript from long audio with VAD — retrying without VAD"
+        );
+        let mut retry_stats = FilterStats {
+            audio_duration_secs: result.stats.audio_duration_secs,
+            ..Default::default()
+        };
+        let stripped = strip_silence(&samples, 16000);
+        retry_stats.samples_after_silence_strip = stripped.len();
+        if !stripped.is_empty() {
+            return transcribe_with_whisper(
+                ctx,
+                &stripped,
+                audio_path,
+                config,
+                retry_stats,
+                true,
+                hints,
+            );
+        }
+    }
+
+    Ok(result)
+}
+
 /// Real transcription using whisper.cpp via whisper-rs.
 ///
 /// When `force_disable_vad` is true, Silero VAD is not passed to whisper even if
 /// the model exists. Used for retry after VAD-enabled transcription produced a blank.
 #[cfg(feature = "whisper")]
 fn transcribe_with_whisper(
+    ctx: &whisper_rs::WhisperContext,
     samples: &[f32],
     _audio_path: &Path,
     config: &Config,
@@ -745,21 +878,10 @@ fn transcribe_with_whisper(
     force_disable_vad: bool,
     hints: &DecodeHints,
 ) -> Result<TranscribeResult, TranscribeError> {
-    // Load whisper model
-    let model_path = resolve_model_path(config)?;
-    tracing::info!(model = %model_path.display(), vad_disabled = force_disable_vad, "loading whisper model");
-
-    let ctx = whisper_rs::WhisperContext::new_with_params(
-        model_path
-            .to_str()
-            .ok_or_else(|| TranscribeError::ModelLoadError("invalid model path encoding".into()))?,
-        whisper_context_params(),
-    )
-    .map_err(|e| TranscribeError::ModelLoadError(format!("{}", e)))?;
-
     tracing::info!(
         samples = samples.len(),
         duration_secs = samples.len() as f64 / 16000.0,
+        vad_disabled = force_disable_vad,
         "starting whisper transcription"
     );
 
@@ -3045,6 +3167,28 @@ mod tests {
         assert!(
             expected_whisper_model_size_bytes("medium").unwrap()
                 > expected_whisper_model_size_bytes("small").unwrap()
+        );
+    }
+
+    #[test]
+    fn chunk_strategy_reuses_context_only_for_whisper_builds() {
+        let mut config = Config::default();
+        config.transcription.engine = "whisper".into();
+        let expected = if cfg!(feature = "whisper") {
+            ChunkTranscriptionStrategy::SharedWhisperContext
+        } else {
+            ChunkTranscriptionStrategy::DispatchPerChunk
+        };
+        assert_eq!(chunk_transcription_strategy(&config), expected);
+    }
+
+    #[test]
+    fn chunk_strategy_keeps_non_whisper_backends_on_dispatch_path() {
+        let mut config = Config::default();
+        config.transcription.engine = "parakeet".into();
+        assert_eq!(
+            chunk_transcription_strategy(&config),
+            ChunkTranscriptionStrategy::DispatchPerChunk
         );
     }
 
